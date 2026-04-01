@@ -654,65 +654,86 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
                                   + (i00 / QK_TURBO3_TCQ);
 
     // Shared memory layout:
-    // x[128]     : rotated+normalized input
-    // cost[512]  : current path costs
+    // x[128]     : rotated+normalized input (also reused as outputs[] after Viterbi)
+    // cost[512]  : current path costs (also reused for reductions)
     // bt[128][256]: backtrace, 4-bit packed (best predecessor index 0-7)
     __shared__ float x[128];
     __shared__ float cost[512];
     __shared__ uint8_t bt[128][256]; // 32KB: bt[t][s/2] = (pred_s_even) | (pred_s_odd << 4)
+    __shared__ int warp_min_idx[16];
+    __shared__ float warp_min_cost[16];
+    __shared__ int shared_initial_state;
 
-    // Thread 0: read source, compute norm, apply InnerQ, normalize, FWHT
-    // Compute directly in shared x[] to avoid register-heavy local array
-    if (sid == 0) {
-        float norm_sq = 0.0f;
-        for (int j = 0; j < 128; j++) { x[j] = grp_src[j]; norm_sq += x[j] * x[j]; }
+    if (sid < 128) x[sid] = grp_src[sid];
+    __syncthreads();
 
-        // InnerQ scaling
-        if (d_innerq_calibrate) {
-            for (int j = 0; j < 128; j++) {
-                atomicAdd(&d_innerq_channel_sq[j], x[j] * x[j]);
-                float abs_val = fabsf(x[j]);
-                unsigned int * addr = (unsigned int *)&d_innerq_channel_max[j];
-                unsigned int old_val = __float_as_uint(abs_val);
-                unsigned int assumed;
-                do {
-                    assumed = *addr;
-                    if (__uint_as_float(assumed) >= abs_val) break;
-                } while (atomicCAS(addr, assumed, old_val) != assumed);
-            }
-            atomicAdd(&d_innerq_count, 1);
-        }
-        for (int j = 0; j < 128; j++) x[j] *= d_innerq_channel_scale[j];
-
-        // Recompute norm after InnerQ
-        norm_sq = 0.0f;
-        for (int j = 0; j < 128; j++) norm_sq += x[j] * x[j];
-        float grp_norm = sqrtf(norm_sq);
-        float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
-        for (int j = 0; j < 128; j++) x[j] *= inv_norm;
-
-        // FWHT rotation (operates on shared memory x[] directly)
-        turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
-
-        // Post-rotation extraction (if enabled)
-        turbo_extract_append(x);
-
-        // Store norm (reuse cost[0] temporarily)
-        cost[0] = grp_norm;
+    if (d_innerq_calibrate && sid < 128) {
+        atomicAdd(&d_innerq_channel_sq[sid], x[sid] * x[sid]);
+        float abs_val = fabsf(x[sid]);
+        unsigned int * addr = (unsigned int *)&d_innerq_channel_max[sid];
+        unsigned int old_val = __float_as_uint(abs_val);
+        unsigned int assumed;
+        do {
+            assumed = *addr;
+            if (__uint_as_float(assumed) >= abs_val) break;
+        } while (atomicCAS(addr, assumed, old_val) != assumed);
+        if (sid == 0) atomicAdd(&d_innerq_count, 1);
     }
+    // No sync needed: calibration writes d_innerq_channel_sq/max, scaling reads d_innerq_channel_scale
+    if (sid < 128) x[sid] *= d_innerq_channel_scale[sid];
+    __syncthreads();
+
+    // Norm reduction
+    cost[sid] = (sid < 128) ? x[sid] * x[sid] : 0.0f;
+    __syncthreads();
+    for (int stride = 256; stride >= 32; stride >>= 1) {
+        if (sid < stride) cost[sid] += cost[sid + stride];
+        __syncthreads();
+    }
+    if (sid < 32) {
+        float v = cost[sid];
+        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        if (sid == 0) cost[0] = v;
+    }
+    __syncthreads();
+    float grp_norm = sqrtf(cost[0]);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    if (sid < 128) x[sid] *= inv_norm;
+    __syncthreads();
+
+    // FWHT
+    if (sid < 128) x[sid] *= d_turbo_wht_signs1[sid];
+    __syncthreads();
+    for (int h = 1; h < 128; h *= 2) {
+        if (sid < 64) {
+            int j = (sid / h) * (2 * h) + (sid % h);
+            float a = x[j], b = x[j + h];
+            x[j] = a + b; x[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    if (sid < 128) x[sid] *= inv_sqrt_128 * d_turbo_wht_signs2[sid];
+    __syncthreads();
+
+    if (sid == 0) turbo_extract_append(x);
+    if (sid == 0) cost[0] = grp_norm;
     __syncthreads();
 
     float saved_norm = cost[0];
 
-    // Initialize Viterbi: free initial state (all states equally viable)
+    // Viterbi forward pass: free initial state (all equally viable)
     cost[sid] = 0.0f;
     __syncthreads();
 
-    // Forward pass: 128 time steps, fully parallel across 512 states
     for (int t = 0; t < 128; t++) {
         float xt = x[t];
 
-        // For state sid: find best predecessor
         // Right-shift trellis: ns = (prev >> 3) | (out << 6)
         // Predecessors of sid: prev = ((sid & 0x3F) << 3) | p, for p = 0..7
         int base_prev = (sid & 0x3F) << 3;
@@ -743,59 +764,93 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
         __syncthreads();
     }
 
-    // Thread 0: find best final state, backtrack, pack bitstream
+    // Warp argmin over 512 costs
+    {
+        float my_cost = cost[sid];
+        int my_idx = sid;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_cost = __shfl_xor_sync(0xFFFFFFFF, my_cost, offset);
+            int other_idx = __shfl_xor_sync(0xFFFFFFFF, my_idx, offset);
+            if (other_cost < my_cost) { my_cost = other_cost; my_idx = other_idx; }
+        }
+        if (sid % 32 == 0) {
+            warp_min_cost[sid / 32] = my_cost;
+            warp_min_idx[sid / 32] = my_idx;
+        }
+    }
+    __syncthreads();
     if (sid == 0) {
-        // Find best final state
-        float min_cost = cost[0];
-        int min_state = 0;
-        for (int s = 1; s < 512; s++) {
-            if (cost[s] < min_cost) {
-                min_cost = cost[s];
-                min_state = s;
-            }
+        float best = warp_min_cost[0];
+        int best_idx = warp_min_idx[0];
+        for (int w = 1; w < 16; w++) {
+            if (warp_min_cost[w] < best) { best = warp_min_cost[w]; best_idx = warp_min_idx[w]; }
         }
+        shared_initial_state = best_idx; // temporarily: best final state (becomes initial after backtrack)
+    }
+    __syncthreads();
 
-        // Backtrack: recover outputs (reuse x[] shared memory as byte array)
-        uint8_t * outputs = (uint8_t *)x; // x[] no longer needed after forward pass
-        int state = min_state;
+    // Backtrack (inherently sequential)
+    uint8_t * outputs = (uint8_t *)x;
+    if (sid == 0) {
+        int state = shared_initial_state;
         for (int t = 127; t >= 0; t--) {
-            outputs[t] = (uint8_t)(state >> 6); // output = top 3 bits (right-shift trellis)
+            outputs[t] = (uint8_t)(state >> 6);
             int p = (bt[t][state / 2] >> ((state % 2) * 4)) & 0xF;
-            state = ((state & 0x3F) << 3) | p; // reconstruct predecessor
+            state = ((state & 0x3F) << 3) | p;
         }
+        shared_initial_state = state;
+    }
+    __syncthreads();
 
-        // After backtrack, 'state' is the initial state chosen by Viterbi
-        const int initial_state = state;
-
-        // Compute reconstruction norm by replaying trellis from initial state
-        float recon_norm_sq = 0.0f;
-        int cur_state = initial_state;
-        for (int t = 0; t < 128; t++) {
-            cur_state = (cur_state >> 3) | (outputs[t] << 6);
-            float c = d_turbo3_tcq_codebook[cur_state];
-            recon_norm_sq += c * c;
+    // Parallel recon norm: t>=2 can compute state directly from 3 outputs (3 shifts of 3 = 9 bits)
+    float my_recon_sq = 0.0f;
+    if (sid < 128) {
+        int cur_state;
+        if (sid < 2) {
+            cur_state = shared_initial_state;
+            for (int t = 0; t <= sid; t++)
+                cur_state = (cur_state >> 3) | (((int)outputs[t]) << 6);
+        } else {
+            cur_state = ((int)outputs[sid - 2] & 0x7)
+                      | (((int)outputs[sid - 1] & 0x7) << 3)
+                      | (((int)outputs[sid]     & 0x7) << 6);
         }
-        float recon_norm = sqrtf(recon_norm_sq);
-        float corrected_norm = (recon_norm > 1e-10f) ? saved_norm / recon_norm : saved_norm;
-        corrected_norm *= innerq_is_k ? d_tcq_norm_alpha : d_tcq_norm_alpha_v;
+        float c = d_turbo3_tcq_codebook[cur_state];
+        my_recon_sq = c * c;
+    }
+    cost[sid] = my_recon_sq;
+    __syncthreads();
+    for (int stride = 256; stride >= 32; stride >>= 1) {
+        if (sid < stride) cost[sid] += cost[sid + stride];
+        __syncthreads();
+    }
+    if (sid < 32) {
+        float v = cost[sid];
+        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        if (sid == 0) cost[0] = v;
+    }
+    __syncthreads();
+    float recon_norm = sqrtf(cost[0]);
+    float corrected_norm = (recon_norm > 1e-10f) ? saved_norm / recon_norm : saved_norm;
+    corrected_norm *= innerq_is_k ? d_tcq_norm_alpha : d_tcq_norm_alpha_v;
 
-        // Pack bitstream: [6 prefix bits] [out_0 (3 bits)] ... [out_127 (3 bits)]
+    // Serial bitpack — byte-alignment prevents parallel atomicOr
+    if (sid == 0) {
         for (int j = 0; j < 49; j++) dst_blk->qs[j] = 0;
-
-        // Write initial state prefix (upper 6 bits = initial_state >> 3)
-        dst_blk->qs[0] = (uint8_t)((initial_state >> 3) & 0x3F);
-
+        dst_blk->qs[0] = (uint8_t)((shared_initial_state >> 3) & 0x3F);
         for (int t = 0; t < 128; t++) {
             const int bit_pos = 6 + t * 3;
             const int byte_idx = bit_pos / 8;
             const int bit_off = bit_pos % 8;
             const int out = outputs[t] & 0x7;
             dst_blk->qs[byte_idx] |= (uint8_t)(out << bit_off);
-            if (bit_off > 5) { // 3 bits cross byte boundary
-                dst_blk->qs[byte_idx + 1] |= (uint8_t)(out >> (8 - bit_off));
-            }
+            if (bit_off > 5) dst_blk->qs[byte_idx + 1] |= (uint8_t)(out >> (8 - bit_off));
         }
-
         dst_blk->norm = __float2half(corrected_norm);
     }
 }
@@ -903,53 +958,76 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     __shared__ float x[128];
     __shared__ float cost[256];
     __shared__ uint8_t bt[128][128]; // 256 states, 4-bit packed (2 per byte), safe even/odd serialization
+    __shared__ int warp_min_idx[8];
+    __shared__ float warp_min_cost[8];
+    __shared__ int shared_initial_state;
 
-    // Thread 0: load data, apply InnerQ, normalize, rotate (same order as turbo3_tcq)
-    if (sid == 0) {
-        float norm_sq = 0.0f;
-        for (int j = 0; j < 128; j++) { x[j] = grp_src[j]; norm_sq += x[j] * x[j]; }
+    if (sid < 128) x[sid] = grp_src[sid];
+    __syncthreads();
 
-        // InnerQ scaling (on raw data, before normalization)
-        if (d_innerq_calibrate) {
-            for (int j = 0; j < 128; j++) {
-                atomicAdd(&d_innerq_channel_sq[j], x[j] * x[j]);
-                float abs_val = fabsf(x[j]);
-                unsigned int * addr = (unsigned int *)&d_innerq_channel_max[j];
-                unsigned int old_val = __float_as_uint(abs_val);
-                unsigned int assumed;
-                do {
-                    assumed = *addr;
-                    if (__uint_as_float(assumed) >= abs_val) break;
-                } while (atomicCAS(addr, assumed, old_val) != assumed);
-            }
-            atomicAdd(&d_innerq_count, 1);
-        }
-        for (int j = 0; j < 128; j++) x[j] *= d_innerq_channel_scale[j];
-
-        // Compute norm after InnerQ, then normalize
-        norm_sq = 0.0f;
-        for (int j = 0; j < 128; j++) norm_sq += x[j] * x[j];
-        float grp_norm = sqrtf(norm_sq);
-        float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
-        for (int j = 0; j < 128; j++) x[j] *= inv_norm;
-
-        // Forward FWHT
-        turbo_rotate_forward_cuda(x, d_turbo_wht_signs1, d_turbo_wht_signs2);
-
-        // Post-rotation extraction (if enabled)
-        turbo_extract_append(x);
-
-        cost[0] = grp_norm; // stash norm
+    if (d_innerq_calibrate && sid < 128) {
+        atomicAdd(&d_innerq_channel_sq[sid], x[sid] * x[sid]);
+        float abs_val = fabsf(x[sid]);
+        unsigned int * addr = (unsigned int *)&d_innerq_channel_max[sid];
+        unsigned int old_val = __float_as_uint(abs_val);
+        unsigned int assumed;
+        do {
+            assumed = *addr;
+            if (__uint_as_float(assumed) >= abs_val) break;
+        } while (atomicCAS(addr, assumed, old_val) != assumed);
+        if (sid == 0) atomicAdd(&d_innerq_count, 1);
     }
+    if (sid < 128) x[sid] *= d_innerq_channel_scale[sid];
+    __syncthreads();
+
+    // Norm reduction
+    cost[sid] = (sid < 128) ? x[sid] * x[sid] : 0.0f;
+    __syncthreads();
+    for (int stride = 128; stride >= 32; stride >>= 1) {
+        if (sid < stride) cost[sid] += cost[sid + stride];
+        __syncthreads();
+    }
+    if (sid < 32) {
+        float v = cost[sid];
+        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        if (sid == 0) cost[0] = v;
+    }
+    __syncthreads();
+    float grp_norm = sqrtf(cost[0]);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    if (sid < 128) x[sid] *= inv_norm;
+    __syncthreads();
+
+    // FWHT
+    if (sid < 128) x[sid] *= d_turbo_wht_signs1[sid];
+    __syncthreads();
+    for (int h = 1; h < 128; h *= 2) {
+        if (sid < 64) {
+            int j = (sid / h) * (2 * h) + (sid % h);
+            float a = x[j], b = x[j + h];
+            x[j] = a + b; x[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+    if (sid < 128) x[sid] *= inv_sqrt_128 * d_turbo_wht_signs2[sid];
+    __syncthreads();
+
+    if (sid == 0) turbo_extract_append(x);
+    if (sid == 0) cost[0] = grp_norm;
     __syncthreads();
 
     float saved_norm = cost[0];
 
-    // Initialize Viterbi: free initial state (all 256 states equally viable)
+    // Viterbi forward pass: free initial state (all equally viable)
     cost[sid] = 0.0f;
     __syncthreads();
 
-    // Forward pass: 128 time steps, parallel across 256 states
     for (int t = 0; t < 128; t++) {
         float xt = x[t];
 
@@ -983,56 +1061,93 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
         __syncthreads();
     }
 
-    // Thread 0: find best final state, backtrack, pack bitstream
+    // Warp argmin over 256 costs
+    {
+        float my_cost = cost[sid];
+        int my_idx = sid;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other_cost = __shfl_xor_sync(0xFFFFFFFF, my_cost, offset);
+            int other_idx = __shfl_xor_sync(0xFFFFFFFF, my_idx, offset);
+            if (other_cost < my_cost) { my_cost = other_cost; my_idx = other_idx; }
+        }
+        if (sid % 32 == 0) {
+            warp_min_cost[sid / 32] = my_cost;
+            warp_min_idx[sid / 32] = my_idx;
+        }
+    }
+    __syncthreads();
     if (sid == 0) {
-        float min_cost = cost[0];
-        int min_state = 0;
-        for (int s = 1; s < 256; s++) {
-            if (cost[s] < min_cost) {
-                min_cost = cost[s];
-                min_state = s;
-            }
+        float best = warp_min_cost[0];
+        int best_idx = warp_min_idx[0];
+        for (int w = 1; w < 8; w++) {
+            if (warp_min_cost[w] < best) { best = warp_min_cost[w]; best_idx = warp_min_idx[w]; }
         }
+        shared_initial_state = best_idx; // temporarily: best final state (becomes initial after backtrack)
+    }
+    __syncthreads();
 
-        // Backtrack
-        uint8_t * outputs = (uint8_t *)x;
-        int state = min_state;
+    // Backtrack (inherently sequential)
+    uint8_t * outputs = (uint8_t *)x;
+    if (sid == 0) {
+        int state = shared_initial_state;
         for (int t = 127; t >= 0; t--) {
-            outputs[t] = (uint8_t)(state >> 6); // output = top 2 bits (k=2)
+            outputs[t] = (uint8_t)(state >> 6);
             int p = (bt[t][state / 2] >> ((state % 2) * 4)) & 0x3;
-            state = ((state & 0x3F) << 2) | p; // reconstruct predecessor
+            state = ((state & 0x3F) << 2) | p;
         }
+        shared_initial_state = state;
+    }
+    __syncthreads();
 
-        const int initial_state = state;
-
-        // Compute reconstruction norm by replaying trellis from initial state
-        float recon_norm_sq = 0.0f;
-        int cur_state = initial_state;
-        for (int t = 0; t < 128; t++) {
-            cur_state = (cur_state >> 2) | (outputs[t] << 6);
-            float c = d_turbo2_tcq_codebook[cur_state];
-            recon_norm_sq += c * c;
+    // Parallel recon norm: t>=3 can compute state directly from 4 outputs (4 shifts of 2 = 8 bits)
+    float my_recon_sq = 0.0f;
+    if (sid < 128) {
+        int cur_state;
+        if (sid < 3) {
+            cur_state = shared_initial_state;
+            for (int t = 0; t <= sid; t++)
+                cur_state = (cur_state >> 2) | (((int)outputs[t]) << 6);
+        } else {
+            cur_state = ((int)outputs[sid - 3] & 0x3)
+                      | (((int)outputs[sid - 2] & 0x3) << 2)
+                      | (((int)outputs[sid - 1] & 0x3) << 4)
+                      | (((int)outputs[sid]     & 0x3) << 6);
         }
-        float recon_norm = sqrtf(recon_norm_sq);
-        float corrected_norm = (recon_norm > 1e-10f) ? saved_norm / recon_norm : saved_norm;
-        corrected_norm *= iq_is_k ? d_tcq_norm_alpha : d_tcq_norm_alpha_v;
+        float c = d_turbo2_tcq_codebook[cur_state];
+        my_recon_sq = c * c;
+    }
+    cost[sid] = my_recon_sq;
+    __syncthreads();
+    for (int stride = 128; stride >= 32; stride >>= 1) {
+        if (sid < stride) cost[sid] += cost[sid + stride];
+        __syncthreads();
+    }
+    if (sid < 32) {
+        float v = cost[sid];
+        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        if (sid == 0) cost[0] = v;
+    }
+    __syncthreads();
+    float recon_norm = sqrtf(cost[0]);
+    float corrected_norm = (recon_norm > 1e-10f) ? saved_norm / recon_norm : saved_norm;
+    corrected_norm *= iq_is_k ? d_tcq_norm_alpha : d_tcq_norm_alpha_v;
 
-        // Pack bitstream: [6 prefix bits] [out_0 (2 bits)] ... [out_127 (2 bits)]
+    // Serial bitpack — byte-alignment prevents parallel atomicOr
+    if (sid == 0) {
         for (int j = 0; j < 33; j++) dst_blk->qs[j] = 0;
-
-        // Write initial state prefix (upper 6 bits = initial_state >> 2)
-        dst_blk->qs[0] = (uint8_t)((initial_state >> 2) & 0x3F);
-
+        dst_blk->qs[0] = (uint8_t)((shared_initial_state >> 2) & 0x3F);
         for (int t = 0; t < 128; t++) {
             const int bit_pos = 6 + t * 2;
             const int byte_idx = bit_pos / 8;
             const int bit_off = bit_pos % 8;
             const int out = outputs[t] & 0x3;
             dst_blk->qs[byte_idx] |= (uint8_t)(out << bit_off);
-            // 2 bits starting at bit_off: max bit_off=6, so 6+2=8 fits in one byte
-            // But bit_off can be 0,2,4,6 (always even) so never crosses boundary
         }
-
         dst_blk->norm = __float2half(corrected_norm);
     }
 }
