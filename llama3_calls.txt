@@ -1,0 +1,15 @@
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+QUANT_CALL k=1024 nb=8
+llama_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+llama_memory_breakdown_print: |   - Host               |                 5028 =  4437 +     324 +     266                |
+llama_memory_breakdown_print: |   - CPU_REPACK         |                 3744 =  3744 +       0 +       0                |

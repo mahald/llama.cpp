@@ -1,0 +1,15 @@
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+QUANT_CALL k=512 nb=4
+llama_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+llama_memory_breakdown_print: |   - Host               |                 4913 =  4460 +     141 +     311                |
+llama_memory_breakdown_print: |   - CPU_REPACK         |                 2976 =  2976 +       0 +       0                |
