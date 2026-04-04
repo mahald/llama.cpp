@@ -278,23 +278,45 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 
-    // TurboQuant 4-bit (D=128 only)
+    // TurboQuant 4-bit (D=128, 256, 512)
     FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASE(128, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASE(128, GGML_TYPE_BF16, GGML_TYPE_TURBO4_0)
+
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_BF16, GGML_TYPE_TURBO4_0)
+
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_BF16, GGML_TYPE_TURBO4_0)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 
-    // TurboQuant 4-bit (D=128 only)
+    // TurboQuant 4-bit (D=128, 256, 512)
     FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
     FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASE(128, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0)
+
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0)
+
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -361,7 +383,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
+            // Allow turbo4 vec kernel without gqa_opt restriction
+            if (!gqa_opt_applies && K->type != GGML_TYPE_TURBO4_0 && V->type != GGML_TYPE_TURBO4_0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
@@ -410,8 +433,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // TurboQuant: only the vec kernel supports inline WHT dequant
+    // Allow D up to 512 for turbo4 (Gemma 4 global layers use 512-dim heads)
     if (K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0) {
-        if (can_use_vector_kernel) {
+        const bool turbo4_vec_ok = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+        if (turbo4_vec_ok) {
             return BEST_FATTN_KERNEL_VEC;
         }
         return BEST_FATTN_KERNEL_NONE;

@@ -237,6 +237,12 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
+    // TurboQuant: pre-transform Q with forward WHT for fast K dot product.
+    // After this, Q_reg contains Q_wht and the K vec_dot just dots raw centroids.
+    if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+        turbo4_pretransform_Q<D, ncols, nthreads_KQ>(Q_reg);
+    }
+
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
@@ -399,6 +405,13 @@ static __global__ void flash_attn_ext_vec(
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
+    }
+
+    // TurboQuant lazy V: apply deferred inverse WHT to VKQ
+    // VKQ has been accumulated in WHT space (centroids * norm, no rotation).
+    // Apply the inverse WHT once now, converting to real space.
+    if constexpr (type_V == GGML_TYPE_TURBO4_0) {
+        turbo4_post_process_VKQ<D, ncols, nthreads_V, V_rows_per_thread>(VKQ);
     }
 
     __shared__ float KQ_max_shared[ncols][WARP_SIZE];
@@ -600,10 +613,24 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
 
-// TurboQuant 4-bit: only D=128 (QK_TURBO4 = head_dim)
+// TurboQuant 4-bit: D=128, 256, 512
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_F16);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_BF16, GGML_TYPE_TURBO4_0);
+
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_BF16, GGML_TYPE_TURBO4_0);
+
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_F16);
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_F16,  GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_BF16, GGML_TYPE_TURBO4_0);

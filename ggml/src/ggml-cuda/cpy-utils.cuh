@@ -229,35 +229,52 @@ static __device__ const float turbo_wht_s2_cpy[128] = {
     -1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
 };
 
-// Serial WHT for single-thread device functions (quantize path)
+// Optimized serial WHT for single-thread device functions (quantize path)
+// Fully unrolled butterfly with fused sign-multiply passes
 // direction 0 = forward, 1 = inverse
-static __device__ void turbo_wht_128_serial(float * x, int direction) {
+static __device__ __forceinline__ void turbo_wht_128_serial(float * __restrict__ x, int direction) {
     const float * s_first  = (direction == 0) ? turbo_wht_s1_cpy : turbo_wht_s2_cpy;
     const float * s_second = (direction == 0) ? turbo_wht_s2_cpy : turbo_wht_s1_cpy;
 
-    for (int i = 0; i < 128; i++) x[i] *= s_first[i];
+    // Fused: sign multiply + first butterfly stage (h=1)
+#pragma unroll
+    for (int j = 0; j < 128; j += 2) {
+        const float a = x[j]     * s_first[j];
+        const float b = x[j + 1] * s_first[j + 1];
+        x[j]     = a + b;
+        x[j + 1] = a - b;
+    }
 
-    for (int h = 1; h < 128; h *= 2) {
+    // Butterfly stages h=2..64 (fully unrolled)
+#pragma unroll
+    for (int h = 2; h < 128; h *= 2) {
+#pragma unroll
         for (int j = 0; j < 128; j += h * 2) {
+#pragma unroll
             for (int k = 0; k < h; k++) {
-                float a = x[j + k];
-                float b = x[j + k + h];
+                const float a = x[j + k];
+                const float b = x[j + k + h];
                 x[j + k]     = a + b;
                 x[j + k + h] = a - b;
             }
         }
     }
 
-    const float scale = 0.08838834764831845f; // 1/sqrt(128)
-    for (int i = 0; i < 128; i++) x[i] *= scale;
-    for (int i = 0; i < 128; i++) x[i] *= s_second[i];
+    // Fused: scale + second sign multiply
+    constexpr float scale = 0.08838834764831845f; // 1/sqrt(128)
+#pragma unroll
+    for (int i = 0; i < 128; i++) {
+        x[i] *= scale * s_second[i];
+    }
 }
 
 // TurboQuant 4-bit: 3-bit PolarQuant indices + 1-bit QJL signs
 // With WHT rotation before centroid search (matches CPU ggml-turbo-quant.c)
+// Optimized: batch 3-bit packing via uint32_t accumulator
 static __device__ void quantize_f32_turbo4_0_block(const float * __restrict__ x, block_turbo4_0 * __restrict__ y) {
     // 1. Compute L2 norm
     float sum_sq = 0.0f;
+#pragma unroll
     for (int i = 0; i < QK_TURBO4; i++) {
         sum_sq += x[i] * x[i];
     }
@@ -270,31 +287,41 @@ static __device__ void quantize_f32_turbo4_0_block(const float * __restrict__ x,
 
     // 2. Normalize into working buffer
     float tmp[128];
+#pragma unroll
     for (int i = 0; i < QK_TURBO4; i++) tmp[i] = x[i] * inv_norm;
 
     // 3. Forward WHT — Gaussianizes the distribution
     turbo_wht_128_serial(tmp, 0);
 
-    // 4. Centroid search on rotated coordinates
-    // Zero output buffers
-    for (int j = 0; j < QK_TURBO4 * 3 / 8; j++) { y->qs[j] = 0; }
+    // 4. Centroid search + batch 3-bit packing
+    // Process 8 elements at a time: 8 × 3 = 24 bits fits in 3 bytes
+#pragma unroll
     for (int j = 0; j < QK_TURBO4 / 8; j++) { y->signs[j] = 0; }
 
-    for (int i = 0; i < QK_TURBO4; i++) {
-        const int idx = turbo_nearest_centroid_3bit(tmp[i]);
+    // Pack 8 centroids at a time into 3 bytes
+#pragma unroll
+    for (int group = 0; group < QK_TURBO4 / 8; group++) {
+        uint32_t packed = 0;
+        uint8_t  sign_byte = 0;
+        const int base = group * 8;
 
-        // Sequential 3-bit packing
-        const int bit_offset = i * 3;
-        const int byte_idx   = bit_offset / 8;
-        const int bit_pos    = bit_offset % 8;
-        y->qs[byte_idx] |= (uint8_t)((idx & 0x7) << bit_pos);
-        if (bit_pos > 5 && byte_idx + 1 < QK_TURBO4 * 3 / 8) {
-            y->qs[byte_idx + 1] |= (uint8_t)((idx & 0x7) >> (8 - bit_pos));
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int idx = turbo_nearest_centroid_3bit(tmp[base + i]);
+            packed |= ((uint32_t)(idx & 0x7)) << (i * 3);
+
+            if (tmp[base + i] >= 0.0f) {
+                sign_byte |= (uint8_t)(1 << i);
+            }
         }
 
-        if (tmp[i] >= 0.0f) {
-            y->signs[i / 8] |= (uint8_t)(1 << (i % 8));
-        }
+        // Write 3 packed bytes (24 bits)
+        const int byte_start = group * 3;
+        y->qs[byte_start]     = (uint8_t)(packed & 0xFF);
+        y->qs[byte_start + 1] = (uint8_t)((packed >> 8) & 0xFF);
+        y->qs[byte_start + 2] = (uint8_t)((packed >> 16) & 0xFF);
+
+        y->signs[group] = sign_byte;
     }
 }
 

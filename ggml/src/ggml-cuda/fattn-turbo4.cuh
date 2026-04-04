@@ -1,15 +1,18 @@
 #pragma once
 
-// TurboQuant 4-bit Flash Attention helpers
-// Warp-shuffle WHT: no shared memory needed.
+// TurboQuant 4-bit Flash Attention helpers — Lazy K + Lazy V
 //
-// K vec_dot: nthreads_KQ=16, 8 elements/thread, 128 total
-//   - 3 local butterfly stages (h=1,2,4)
-//   - 4 warp-shuffle stages (h=8,16,32,64)
+// Both K and V WHT operations are deferred to avoid per-position overhead:
 //
-// V dequant: nthreads_V=32, 4 elements/thread, 128 total
-//   - 2 local butterfly stages (h=1,2)
-//   - 5 warp-shuffle stages (h=4,8,16,32,64)
+// K path: Instead of inverse WHT on every K vector, apply a FORWARD WHT
+//   to Q once (before the KV loop). Then Q_wht · centroids = Q · WHT_inv(centroids).
+//   Per-position K cost: centroid unpack + dot + norm multiply. No WHT.
+//
+// V path: Accumulate attention-weighted centroids*norm in WHT space.
+//   Apply a single inverse WHT to VKQ after the KV loop.
+//   Per-position V cost: centroid unpack + norm multiply. No WHT.
+//
+// Result: WHT cost is O(1) per head instead of O(context_length).
 
 // Lloyd-Max centroids for 3-bit quantization — must match ggml-turbo-quant.c
 static __device__ const float fattn_turbo_centroids[8] = {
@@ -41,7 +44,7 @@ static __device__ const float fattn_turbo_s2[128] = {
 };
 
 // ============================================================
-// Helper: unpack one 3-bit centroid from packed qs[] array
+// Helper: unpack one 3-bit centroid (fallback, used rarely)
 // ============================================================
 static __device__ __forceinline__ float turbo4_unpack_centroid(
         const uint8_t * __restrict__ qs, int j) {
@@ -57,11 +60,49 @@ static __device__ __forceinline__ float turbo4_unpack_centroid(
 }
 
 // ============================================================
+// Batch decode: 8 centroids from byte-aligned position
+//
+// For K vec_dot: elem_start = lane * 8, so bit_offset = lane * 24
+// which is always byte-aligned (24 % 8 = 0).
+// One uint32_t load covers all 24 bits (8 × 3-bit indices).
+// ============================================================
+static __device__ __forceinline__ void turbo4_batch_unpack_8(
+        const uint8_t * __restrict__ qs, int elem_start, float * __restrict__ out) {
+    const int byte_start = (elem_start * 3) / 8;  // = lane * 3
+    // Load 3 bytes (24 bits = 8 × 3-bit indices), no alignment requirement
+    const uint32_t raw = (uint32_t)qs[byte_start]
+                       | ((uint32_t)qs[byte_start + 1] << 8)
+                       | ((uint32_t)qs[byte_start + 2] << 16);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out[i] = fattn_turbo_centroids[(raw >> (i * 3)) & 0x7];
+    }
+}
+
+// ============================================================
+// Batch decode: 4 centroids from arbitrary position
+//
+// For V dequant (ne=4): 12 bits needed, uint16_t covers all cases
+// even with non-zero bit_pos (max bit_pos + 12 = 16).
+// ============================================================
+static __device__ __forceinline__ void turbo4_batch_unpack_4(
+        const uint8_t * __restrict__ qs, int local_i, float * __restrict__ out) {
+    const int bit_offset = local_i * 3;
+    const int byte_idx   = bit_offset / 8;
+    const int bit_pos    = bit_offset % 8;
+    // Load 2 bytes (16 bits covers 12 data bits + up to 4 bit_pos offset)
+    const uint32_t raw = (uint32_t)qs[byte_idx] | ((uint32_t)qs[byte_idx + 1] << 8);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        out[i] = fattn_turbo_centroids[(raw >> (bit_pos + i * 3)) & 0x7];
+    }
+}
+
+// ============================================================
 // Helper: in-register butterfly for local WHT stages
 // ============================================================
 template <int N>
 static __device__ __forceinline__ void turbo4_local_wht(float * vals) {
-    // Butterfly stages where h < N (all pairs are within this thread's elements)
 #pragma unroll
     for (int h = 1; h < N; h *= 2) {
 #pragma unroll
@@ -79,13 +120,9 @@ static __device__ __forceinline__ void turbo4_local_wht(float * vals) {
 
 // ============================================================
 // Helper: warp-shuffle butterfly for inter-thread WHT stages
-//   N = elements per thread
-//   lane = thread's position within the cooperating group
 // ============================================================
 template <int N>
 static __device__ __forceinline__ void turbo4_shuffle_wht(float * vals, int lane) {
-    // For 128 elements total, max h = 64.
-    // Shuffle stages start at h = N (first stage needing inter-thread exchange).
 #pragma unroll
     for (int h = N; h < 128; h *= 2) {
         const int lane_mask = h / N;
@@ -99,166 +136,297 @@ static __device__ __forceinline__ void turbo4_shuffle_wht(float * vals, int lane
     }
 }
 
+
 // ============================================================
-// K vec_dot: dot(inverse_WHT(centroids) * norm, Q)
+// Q pre-transformation: forward WHT on Q registers
 //
-// Template params match other vec_dot functions.
-// D = head dimension (must be 128 for turbo4)
-// nthreads = nthreads_KQ (must be 16 for turbo4)
+// Applied once before the KV loop. Transforms Q so that:
+//   Q_wht · centroids = Q · WHT_inv(centroids)
 //
-// Q_v = half2 or float2 array, (D/2)/nthreads entries per thread
-//       Thread t holds Q elements [D/nthreads * t, D/nthreads * t + D/nthreads - 1]
-//       = 8 contiguous Q values as 4 half2 or float2 pairs
+// Math: Q_wht = inv_sqrt * diag(s2) * H * diag(s1) * Q
+//   where H is the Hadamard butterfly (symmetric: H = H^T)
 //
-// Each of the 16 threads holds 8 K elements. WHT via 3 local + 4 shuffle stages.
+// After this, the K vec_dot just dots raw centroids with Q_wht.
+//
+// Template params must match the kernel's nthreads_KQ and Q_reg layout.
+// nthreads_KQ = 16, each thread has (D/2)/16 half2 pairs = 4 per block.
+// ============================================================
+template <int D, int ncols, int nthreads_KQ>
+static __device__ __forceinline__ void turbo4_pretransform_Q(
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    half2 Q_reg[][D/2/nthreads_KQ]
+#else
+    float2 Q_reg[][D/2/nthreads_KQ]
+#endif
+) {
+    constexpr int n_k_blocks = D / QK_TURBO4;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    const int kq_lane = threadIdx.x % nthreads_KQ;  // 0..15
+    const int elem_start = kq_lane * 8;
+
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+        for (int b = 0; b < n_k_blocks; ++b) {
+            // Extract 8 float values from 4 half2/float2 pairs
+            float qvals[8];
+#ifdef V_DOT2_F32_F16_AVAILABLE
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f2 = __half22float2(Q_reg[j][b * 4 + i]);
+                qvals[2*i]     = f2.x;
+                qvals[2*i + 1] = f2.y;
+            }
+#else
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                qvals[2*i]     = Q_reg[j][b * 4 + i].x;
+                qvals[2*i + 1] = Q_reg[j][b * 4 + i].y;
+            }
+#endif
+
+            // Forward WHT: s1 first, butterfly, then s2 * inv_sqrt
+            // This is the transpose of the inverse WHT (which does s2, butterfly, s1)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                qvals[i] *= fattn_turbo_s1[elem_start + i];
+            }
+
+            turbo4_local_wht<8>(qvals);
+            turbo4_shuffle_wht<8>(qvals, kq_lane);
+
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                qvals[i] *= inv_sqrt_128 * fattn_turbo_s2[elem_start + i];
+            }
+
+            // Store back to Q_reg
+#ifdef V_DOT2_F32_F16_AVAILABLE
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                Q_reg[j][b * 4 + i] = make_half2(__float2half(qvals[2*i]), __float2half(qvals[2*i + 1]));
+            }
+#else
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                Q_reg[j][b * 4 + i] = make_float2(qvals[2*i], qvals[2*i + 1]);
+            }
+#endif
+        }
+    }
+}
+
+
+// ============================================================
+// K vec_dot: FAST mode — Q is pre-transformed, just dot centroids
+//
+// Q_v contains WHT-transformed Q values (from turbo4_pretransform_Q).
+// Per-position cost: centroid unpack + dot product + norm scale.
+// No WHT butterfly, no sign array lookups in the hot loop.
+//
+// Math: Q_wht · c * norm = Q · K_full
+//   (inv_sqrt and sign arrays are baked into Q_wht)
 // ============================================================
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v,
     const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
 
-    static_assert(D == 128, "turbo4 FA vec_dot requires D=128");
+    static_assert(D == 128 || D == 256 || D == 512,
+                  "turbo4 FA vec_dot requires D=128, 256, or 512");
     static_assert(nthreads == 16, "turbo4 FA vec_dot requires nthreads_KQ=16");
     GGML_UNUSED(Q_q8);
     GGML_UNUSED(Q_ds_v);
 
-    const block_turbo4_0 * block = (const block_turbo4_0 *) K_c;
-    const float norm = __half2float(block->norm);
+    constexpr int n_blocks = D / QK_TURBO4;
 
-    const int lane = threadIdx.x % nthreads; // 0..15
-    const int elem_start = lane * 8;          // first of 8 elements this thread owns
+    const int lane = threadIdx.x % nthreads;
+    const int elem_start = lane * 8;
 
-    // 1. Unpack 8 centroids
-    float kval[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        kval[i] = turbo4_unpack_centroid(block->qs, elem_start + i);
-    }
-
-    // 2. Inverse WHT (direction=1): s_first=s2, s_second=s1
-
-    // Multiply by s2 (first sign array for inverse)
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        kval[i] *= fattn_turbo_s2[elem_start + i];
-    }
-
-    // Local butterfly stages: h=1,2,4 (within 8 elements)
-    turbo4_local_wht<8>(kval);
-
-    // Shuffle butterfly stages: h=8,16,32,64
-    turbo4_shuffle_wht<8>(kval, lane);
-
-    // Scale by 1/sqrt(128) and multiply by s1 (second sign array for inverse)
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        kval[i] *= inv_sqrt_128 * fattn_turbo_s1[elem_start + i];
-    }
-
-    // 3. Scale by norm
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        kval[i] *= norm;
-    }
-
-    // 4. Dot product with Q
-    //    Q_v has 4 entries (half2 or float2), covering 8 Q values.
     float sum = 0.0f;
 
+#pragma unroll
+    for (int b = 0; b < n_blocks; ++b) {
+        const block_turbo4_0 * block = (const block_turbo4_0 *)(K_c) + b;
+        const float norm = __half2float(block->norm);
+
+        // Unpack raw centroids (no WHT, no sign arrays)
+        // Batch unpack 8 raw centroids (one uint32_t load)
+        float kval[8];
+        turbo4_batch_unpack_8(block->qs, elem_start, kval);
+
+        // Dot with pre-transformed Q (inv_sqrt and signs baked in)
+        float block_sum = 0.0f;
+
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    const half2 * Q_h2 = (const half2 *) Q_v;
+        const half2 * Q_h2 = (const half2 *) Q_v;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const float2 q_f2 = __half22float2(Q_h2[i]);
-        sum += kval[2*i + 0] * q_f2.x;
-        sum += kval[2*i + 1] * q_f2.y;
-    }
+        for (int i = 0; i < 4; ++i) {
+            const float2 q_f2 = __half22float2(Q_h2[b * 4 + i]);
+            block_sum += kval[2*i + 0] * q_f2.x;
+            block_sum += kval[2*i + 1] * q_f2.y;
+        }
 #else
-    const float2 * Q_f2 = (const float2 *) Q_v;
+        const float2 * Q_f2 = (const float2 *) Q_v;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        sum += kval[2*i + 0] * Q_f2[i].x;
-        sum += kval[2*i + 1] * Q_f2[i].y;
+        for (int i = 0; i < 4; ++i) {
+            block_sum += kval[2*i + 0] * Q_f2[b * 4 + i].x;
+            block_sum += kval[2*i + 1] * Q_f2[b * 4 + i].y;
+        }
+#endif
+        sum += block_sum * norm;
     }
-#endif // V_DOT2_F32_F16_AVAILABLE
 
     return sum;
 }
 
 
 // ============================================================
-// V dequantize: inverse_WHT(centroids) * norm → output ne elements
+// Batch decode: 16 centroids from byte-aligned position
 //
-// Called by all 32 warp threads simultaneously for the same V block.
-// Thread threadIdx.x handles elements [i0, i0+ne-1] where i0 = threadIdx.x * ne.
-// With ne=4 and 32 threads: 128 elements total.
-//
-// WHT via 2 local + 5 shuffle stages.
+// For V dequant (ne=16, D=512): local_i is multiple of 16,
+// bit_offset = local_i * 3 is multiple of 48 (byte-aligned).
+// 48 bits needed, uint64_t covers it.
+// ============================================================
+static __device__ __forceinline__ void turbo4_batch_unpack_16(
+        const uint8_t * __restrict__ qs, int local_i, float * __restrict__ out) {
+    const int byte_start = (local_i * 3) / 8;
+    // Load 6 bytes (48 bits = 16 × 3-bit indices)
+    const uint64_t raw = (uint64_t)qs[byte_start]
+                       | ((uint64_t)qs[byte_start + 1] << 8)
+                       | ((uint64_t)qs[byte_start + 2] << 16)
+                       | ((uint64_t)qs[byte_start + 3] << 24)
+                       | ((uint64_t)qs[byte_start + 4] << 32)
+                       | ((uint64_t)qs[byte_start + 5] << 40);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        out[i] = fattn_turbo_centroids[(raw >> (i * 3)) & 0x7];
+    }
+}
+
+
+// ============================================================
+// V dequantize: LAZY mode — centroid lookup + norm only, NO WHT
 // ============================================================
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo4_0(
     const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
 
-    static_assert(ne == 4, "turbo4 FA V dequant requires ne=4 (32 threads × 4 = 128)");
+    static_assert(ne == 4 || ne == 8 || ne == 16,
+                  "turbo4 FA V dequant requires ne=4, 8, or 16");
 
     const block_turbo4_0 * block = (const block_turbo4_0 *) ((const char *)vx);
 
-    // Determine which block this i0 belongs to.
-    // turbo4: QK=128, so block = i0/128, local offset = i0%128.
-    // In the FA kernel, V + k*nb21 already points to the right row.
-    // Since QK_TURBO4=128=D, i0 is the local offset within the single block.
     const int64_t ib  = i0 / QK_TURBO4;
     const int local_i = (int)(i0 % QK_TURBO4);
     const block_turbo4_0 * blk = block + ib;
 
     const float norm = __half2float(blk->norm);
-    const int lane = local_i / ne; // = threadIdx.x for the standard calling pattern
 
-    // 1. Unpack 4 centroids
-    float vals[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vals[i] = turbo4_unpack_centroid(blk->qs, local_i + i);
+    // Batch decode centroids based on ne
+    float vals[ne];
+    if constexpr (ne == 4) {
+        turbo4_batch_unpack_4(blk->qs, local_i, vals);
+    } else if constexpr (ne == 8) {
+        turbo4_batch_unpack_8(blk->qs, local_i, vals);
+    } else {
+        turbo4_batch_unpack_16(blk->qs, local_i, vals);
     }
 
-    // 2. Inverse WHT (direction=1): s_first=s2, s_second=s1
-
-    // Multiply by s2
+    // Scale by norm
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vals[i] *= fattn_turbo_s2[local_i + i];
+    for (int i = 0; i < ne; ++i) {
+        vals[i] *= norm;
     }
 
-    // Local butterfly stages: h=1,2 (within 4 elements)
-    turbo4_local_wht<4>(vals);
-
-    // Shuffle butterfly stages: h=4,8,16,32,64
-    turbo4_shuffle_wht<4>(vals, lane);
-
-    // Scale by 1/sqrt(128), multiply by s1, scale by norm
-    constexpr float inv_sqrt_128 = 0.08838834764831845f;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        vals[i] *= inv_sqrt_128 * fattn_turbo_s1[local_i + i] * norm;
-    }
-
-    // 3. Output
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
-        const half2 * dummy = nullptr; GGML_UNUSED(dummy); // suppress unused warning
+        const half2 * dummy = nullptr; GGML_UNUSED(dummy);
 #pragma unroll
-        for (int l0 = 0; l0 < 4; l0 += 2) {
+        for (int l0 = 0; l0 < ne; l0 += 2) {
             ((half2 *) dst)[l0/2] = make_half2(__float2half(vals[l0]), __float2half(vals[l0 + 1]));
         }
     } else
-#endif // FP16_AVAILABLE
+#endif
     if constexpr (std::is_same_v<T, float>) {
 #pragma unroll
-        for (int l = 0; l < 4; ++l) {
+        for (int l = 0; l < ne; ++l) {
             ((float *) dst)[l] = vals[l];
         }
     } else {
         static_assert(std::is_same_v<T, void>, "unsupported type for turbo4 V dequant");
+    }
+}
+
+
+// ============================================================
+// Post-processing: apply deferred inverse WHT to accumulated VKQ
+//
+// Called once after the KV loop. Converts VKQ from WHT space
+// to real space via inverse WHT per 128-element block.
+// ============================================================
+template <int D, int ncols, int nthreads_V, int V_rows_per_thread>
+static __device__ __forceinline__ void turbo4_post_process_VKQ(
+#ifdef V_DOT2_F32_F16_AVAILABLE
+    half2 VKQ[][D/2/nthreads_V]
+#else
+    float2 VKQ[][D/2/nthreads_V]
+#endif
+) {
+    constexpr int n_v_blocks = D / QK_TURBO4;
+    constexpr float inv_sqrt_128 = 0.08838834764831845f;
+
+    const int v_lane  = threadIdx.x;
+    const int local_i = v_lane * V_rows_per_thread;
+
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+        for (int vb = 0; vb < n_v_blocks; ++vb) {
+            const int vkq_base = vb * ((QK_TURBO4 / 2) / nthreads_V);
+
+            float vals[V_rows_per_thread];
+#ifdef V_DOT2_F32_F16_AVAILABLE
+#pragma unroll
+            for (int i = 0; i < V_rows_per_thread; i += 2) {
+                const float2 f2 = __half22float2(VKQ[j][vkq_base + i/2]);
+                vals[i]   = f2.x;
+                vals[i+1] = f2.y;
+            }
+#else
+#pragma unroll
+            for (int i = 0; i < V_rows_per_thread; i += 2) {
+                vals[i]   = VKQ[j][vkq_base + i/2].x;
+                vals[i+1] = VKQ[j][vkq_base + i/2].y;
+            }
+#endif
+
+            // Inverse WHT: s2 → butterfly → s1 * inv_sqrt
+#pragma unroll
+            for (int i = 0; i < V_rows_per_thread; ++i) {
+                vals[i] *= fattn_turbo_s2[local_i + i];
+            }
+
+            turbo4_local_wht<V_rows_per_thread>(vals);
+            turbo4_shuffle_wht<V_rows_per_thread>(vals, v_lane);
+
+#pragma unroll
+            for (int i = 0; i < V_rows_per_thread; ++i) {
+                vals[i] *= inv_sqrt_128 * fattn_turbo_s1[local_i + i];
+            }
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+#pragma unroll
+            for (int i = 0; i < V_rows_per_thread; i += 2) {
+                VKQ[j][vkq_base + i/2] = make_half2(__float2half(vals[i]), __float2half(vals[i+1]));
+            }
+#else
+#pragma unroll
+            for (int i = 0; i < V_rows_per_thread; i += 2) {
+                VKQ[j][vkq_base + i/2] = make_float2(vals[i], vals[i+1]);
+            }
+#endif
+        }
     }
 }
