@@ -56,8 +56,6 @@ The CUDA kernel development was done mostly using Claude 4.6 Opus. I directed th
 
 ## Fork
 
-[LINK TO YOUR GITHUB REPO HERE]
-
 Built on top of the existing TurboQuant llama.cpp fork. To test:
 
 ```bash
