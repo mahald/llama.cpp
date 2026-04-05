@@ -241,6 +241,13 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
+    // env: LLAMA_ATTN_ROT_DISABLE
+    bool attn_rot_k = false;
+    bool attn_rot_v = false;
+
+    // pre-computed hadamard martrices
+    std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
@@ -364,7 +371,7 @@ public:
     ggml_tensor * get_turbo_rot_inverse() const override;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    // note: the heads in k_cur and v_cur should be layed out contiguously in memory
+    // note: the heads in k_cur and v_cur should be laid out contiguously in memory
     //   - k_cur  [n_embd_head_k, n_head_k, n_tokens]
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]

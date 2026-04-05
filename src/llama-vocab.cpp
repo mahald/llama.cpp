@@ -494,10 +494,14 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                 };
                 break;
             case LLAMA_VOCAB_PRE_TYPE_GEMMA4:
+                // Gemma4 uses SPM-style BPE: spaces are replaced with ▁ by the
+                // normalizer, then BPE merges run on the whole text without
+                // word-level pre-splitting. We only need to split on newlines
+                // since BPE merge lookup asserts no newlines in tokens.
                 regex_exprs = {
                     "[^\\n]+|[\\n]+",
                 };
-                byte_encode = false;
+                byte_encode = false; // uses raw UTF-8, not GPT-2 byte encoding
                 break;
             default:
                 // default regex for BPE tokenization pre-processing
@@ -512,7 +516,7 @@ struct llm_tokenizer_bpe : llm_tokenizer {
     }
 
     std::vector<std::string> regex_exprs;
-    bool byte_encode = true;
+    bool byte_encode = true; // GPT-2 byte encoding; false for SPM-style BPE (raw UTF-8)
 };
 
 struct llm_tokenizer_bpe_session {
@@ -574,6 +578,7 @@ struct llm_tokenizer_bpe_session {
                 symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
                 offset = word.size();
             } else if (tok_pre == LLAMA_VOCAB_PRE_TYPE_GEMMA4 && word.find_first_not_of('\n') == std::string::npos) {
+                // fix for gemma 4, ref: https://github.com/ggml-org/llama.cpp/pull/21343
                 auto tok = vocab.text_to_token(word);
                 if (tok != LLAMA_TOKEN_NULL) {
                     symbols.emplace_back(llm_symbol{-1, -1, word.c_str(), word.size()});
@@ -2546,6 +2551,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "<|end_of_text|>"
                     || t.first == "<end_of_utterance>" // smoldocling
                     || t.first == "<turn|>" // gemma4
+                    || t.first == "<|tool_response>" // gemma4
                     || t.first == "<｜end▁of▁sentence｜>" // deepseek-ocr
                ) {
                 special_eog_ids.insert(t.second);
@@ -3088,6 +3094,10 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
 
+                        if (escape_whitespaces) {
+                            llama_escape_whitespace(text);
+                        }
+
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("TT: (%ld %ld %ld) '%s'\n", text.length(), fragment.offset, fragment.length, text.c_str());
 #endif
@@ -3270,7 +3280,8 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
                     return _try_copy(token_text.data(), token_text.size());
                 }
                 if (attr & LLAMA_TOKEN_ATTR_NORMAL) {
-                    if (vocab.get_escape_whitespaces()) {
+                    if (escape_whitespaces) {
+                        // SPM-style BPE: tokens contain ▁ for spaces
                         std::string result = token_text;
                         llama_unescape_whitespace(result);
                         return _try_copy(result.data(), result.size());
@@ -3705,9 +3716,7 @@ int llama_vocab::max_token_len() const {
 
 int llama_vocab::find_bpe_rank(const std::string & token_left, const std::string & token_right) const {
     GGML_ASSERT(token_left.find(' ')   == std::string::npos);
-    GGML_ASSERT(token_left.find('\n')  == std::string::npos);
     GGML_ASSERT(token_right.find(' ')  == std::string::npos);
-    GGML_ASSERT(token_right.find('\n') == std::string::npos);
 
     auto it = pimpl->bpe_ranks.find(std::make_pair(token_left, token_right));
     if (it == pimpl->bpe_ranks.end()) {

@@ -298,13 +298,19 @@ Prefill pp4096 (tok/s):
 **Paper**: ConvRot (arXiv:2512.03673, Dec 2025)
 **What**: Replace full d=128 FWHT with group-of-32 Hadamard transforms. Tom tested this directly and it produces unacceptable PPL. Full d=128 rotation is necessary for proper decorrelation.
 
-### 36. Temporal decay — progressive 3→2 bit requantization
-**Status**: unblocked — turbo2 implemented (#28), needs per-position type tracking infra
+### 36. Temporal decay — progressive 3→2 bit requantization `tested-marginal`
+**Status**: done — marginal gain over pure turbo2 V, not worth the complexity
 **Type**: quality + memory
 **Source**: TheTom/turboquant_plus/benchmarks/temporal_decay_prototype.py
-**What**: Old tokens requantized turbo3→turbo2. ~30% extra memory savings.
-**Prerequisites**: GGML_TYPE_TURBO2_0 now available (#28). Still needs per-position type tracking in KV cache. turbo2 benchmark data (PPL 6.78 uniform, +8% vs f16) suggests this may only be viable for tokens >16K positions back where attention weights are negligible.
-**Updated assessment** (2026-03-27): Given turbo2's +8% uniform PPL hit, temporal decay would need to be very selective about which tokens to demote. May combine well with sparse V dequant (#51) — if attention weight is <1e-6, the requantization error doesn't matter.
+**Branch**: `experiment/mixed-type-v-decay`
+**What**: Mixed-type V cache: turbo2 cold + turbo3 hot ring buffer. Older V tokens demoted to turbo2, recent tokens kept at turbo3.
+**Implementation**: Ring buffer overlay in KV cache, per-position type tracking, overlay kernel for dequant path. Fixed hybrid model set_input + ring buffer race condition.
+**Results** (turbo3 K, Qwen3.5-27B):
+- 32K: decay=4096 saves 36 MiB (8%) at +1.2% PPL. decay=2048 saves 50 MiB (11%) at +2.3% PPL.
+- 64K: decay=4096 saves 100 MiB (11%) at +4.0% PPL. decay=2048 saves 114 MiB (13%) at +4.0% PPL.
+- Pure turbo2 V saves 128 MiB (14%) at +4.7% PPL — nearly as good with no overlay complexity.
+- Decode speed: zero overhead from overlay kernel (30.13 vs 30.11 tok/s at 32K).
+**Conclusion**: The 0.7% PPL advantage of mixed decay over pure turbo2 V does not justify the ring buffer + overlay complexity. Pure `-ctv turbo2 -ctk turbo3` is the simpler path for memory pressure.
 
 ### 28. turbo2 (2-bit) variant
 **Status**: done — IMPLEMENTED AND TESTED
@@ -440,15 +446,32 @@ Our pipeline makes CAT-style interventions ineffective on head_dim=256:
 **Risk**: Our norm correction assumes rotation — need to verify norm correction still works on unrotated K.
 **Difficulty**: Medium (1 week). Straightforward to test.
 
-### 43. SQuat-inspired query-orthogonal codebook selection
-**Status**: needs-research
+### 43. SQuat-inspired query-orthogonal codebook selection `dropped`
+**Status**: dropped — FWHT makes Q subspace too isotropic
 **Type**: quality
 **Paper**: SQuat (arXiv:2503.24358, Mar 2025, Red Hat AI)
-**What**: Instead of minimizing ||k - k_quantized|| (compression error), SQuat ensures quantization residual is **orthogonal to the query subspace**. Query subspace from prompt SVD (rank ~30 for d=4096), generalizes to response tokens. 2-bit, no fine-tuning, no calibration data.
-**How it applies**: After FWHT rotation makes the distribution uniform, SQuat's orthogonality constraint ensures whatever residual quantization error remains is **invisible to queries**. The prompt-derived subspace can be computed once at prompt time with no ongoing cost. Could be combined with Lloyd-Max by biasing codebook selection toward codewords whose error is orthogonal to the query subspace.
-**Challenge**: O(d³) for the iterative quantization algorithm. May be too expensive for per-token SET_ROWS. A simplified version (project quantization error onto query subspace and minimize that instead of MSE) could be cheaper.
-**Difficulty**: High (2-3 weeks). Strongest theoretical backing for quality improvement.
-**Research completed 2026-03-27**: See detailed analysis in memory/reference_squat_algorithm_deep_dive.md. Code at github.com/Red-Hat-AI-Innovation-Team/SQuat. Key finding: O(d^2) per-token cost is trivial at d=128. Critical tension: FWHT rotation may destroy the low-rank query subspace structure SQuat exploits. Recommended: test Option B (block iterative update) first, measuring both rotated and unrotated Q subspace rank.
+**What**: Bias K quantization so residual error is orthogonal to the query subspace. Schur complement group-by-group Lagrangian compensation. CUDA implementation complete (turbo-quant-cuda.cuh, fattn.cu, set-rows.cu).
+
+**Real-model results** (2026-03-29, Qwen3.5-27B turbo3):
+- Baseline PPL: 5.8325
+- SQuat λ=2 rank=59: PPL 5.8590 (+0.45%) — WORSE
+- SQuat λ=2 rank=8: PPL 5.8878 (+0.95%) — WORSE
+- SQuat λ=5: PPL 5.8606 (+0.48%) — WORSE
+- SQuat λ=50: PPL 5.9102 (+1.3%) — WORSE
+
+**Root cause**: FWHT rotation makes the Q subspace nearly isotropic. Post-FWHT P_Q diagonal = 0.46 ± 0.054 (mean ± std), i.e., ALL directions have nearly equal weight. The 90% variance threshold needs rank=59 out of 128 dims. SQuat's Q-projected MSE reduction (28%) comes at the cost of 11% total MSE increase. With only ~46% of Q variance in the subspace, the increased total MSE outweighs the directional benefit.
+
+**Breakeven analysis** (Python, `scripts/squat_validate_real_pq.py`):
+| Q distribution | Attn error change |
+|---|---|
+| 100% in P_Q subspace | +15.0% reduction |
+| 80/20 subspace/isotropic | +12.7% reduction |
+| 50/50 | +0.3% (neutral) |
+| Isotropic | -6.1% (worse) |
+
+Real post-FWHT Q is ~50/50 → breakeven point → no PPL improvement.
+
+**Same root cause as PQ (#60)**: FWHT destroys directional structure. SQuat needs low-rank Q (effective_rank << d). FWHT makes Q nearly full-rank. SQuat would work for systems WITHOUT FWHT rotation (e.g., VecInfer's PQ on raw K).
 
 ### 44. PatternKV — pattern subtraction before codebook
 **Status**: research-complete — **LOW expected value** (FWHT already solves distribution flattening)
@@ -719,12 +742,12 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Expected gain**: Small PPL improvement at low bit rates (turbo2/turbo3). Negligible at turbo4 where we're already beating q8_0.
 **Result**: Already covered by InnerQ (#52). VecInfer's formula = InnerQ mode=1 (max-based), which was tested and found WORSE than baseline on turbo3. InnerQ mode=0 (RMS, strength=0.20) gives 46% gap closure on hd128, auto-disables on hd256 (already balanced). No additional work needed.
 
-### 60. Product quantization + ADC lookup tables for K (from VecInfer) `needs-research`
-**Paper**: arXiv:2510.06175 (Oct 2025). VecInfer uses Product Quantization (PQ) instead of scalar VQ for keys. The key insight: PQ enables Asymmetric Distance Computation (ADC) — precompute `query_subvec · centroid` lookup table once per query, then each key token's attention score is just M integer-indexed table lookups instead of full dequant + dot product. For d=128, M=64 sub-vectors of dim 2: 64 uint8 lookups + 63 adds vs 128 dequant + 128 FMA.
-**Why**: Fundamentally faster Q·K computation. VecInfer reports 2.7x attention speedup on H100 at 2-bit. The fused kernel (compute on quantized, never dequant K) is the dream path.
-**Implementation**: Major arch change — replace scalar Lloyd-Max codebook with PQ codebook (M sub-vectors × C centroids). Requires offline codebook training (faiss k-means, ~256 calibration samples). New SET_ROWS kernel (PQ encode), new FA kernel (ADC LUT + table lookup). Format change.
-**Risk**: High — complete rework of quantization + attention for K. V can stay scalar. Python prototype first to validate quality (PQ MSE vs scalar Lloyd-Max MSE at same bit rate).
-**Expected gain**: Potentially large decode speedup at long context. Quality may differ — PQ sub-vector independence assumption vs scalar per-element optimality.
+### 60. Product quantization + ADC lookup tables for K (from VecIncer) `dropped`
+**Paper**: arXiv:2510.06175 (Oct 2025). VecInfer uses PQ instead of scalar VQ for keys, enabling ADC (table lookup Q·K without dequant).
+**Simulation** (2026-03-29, `scripts/pq_simulate.py`):
+PQ is **fundamentally incompatible with FWHT rotation**. Post-FWHT data is i.i.d. Gaussian — there is NO within-sub-vector correlation for PQ to exploit. At the same bit rate, PQ degenerates to scalar quantization (sub_d=1). At lower bit rates, PQ is 350-1466% worse in MSE than scalar Lloyd-Max.
+VecInfer works because they skip rotation entirely (PQ on raw correlated K vectors). Adopting PQ would mean dropping FWHT, losing the Gaussianization that makes our universal codebook optimal.
+**Verdict**: Dead end for our pipeline. ADC speed benefit requires PQ, but PQ quality requires correlated data, which FWHT eliminates.
 
 ### 61. Trellis-coded quantization (TCQ) for turbo2 + turbo3 `tested-success`
 **Source**: QTIP (NeurIPS 2024, arXiv:2406.11235) + Marcellin & Fischer 1990. From V.34 modem TCM, adapted for source coding. Cross-field idea from telecoms.
@@ -761,10 +784,15 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 - CUDA-trained codebooks find lower MSE but worse PPL — different GLA local optima. numpy codebook is best.
 - Training scripts: `scripts/tcq_train_vectorized.py` (best), `scripts/tcq_train_cuda.cu`
 
-### 62. Per-32 norm within 128-element rotation groups `planned`
+### 62. Per-32 norm within 128-element rotation groups `simulated-modest`
 **Source**: signalnine/llama-cpp-turboquant (NVIDIA contributor). Merged into TheTom's tree 2026-03-29.
 **Concept**: FWHT over 128 elements, but store a separate corrected norm per 32-element sub-block. 4x finer norm granularity captures local amplitude variation in post-WHT data.
-**Tradeoff**: +0.5 bpv overhead. At 2-bit: 2.5 bpv. turbo2_tcq at 2.25 bpv gets 6.06, signalnine's per-32-norm at 2.5 bpv gets 6.01. Similar quality, different approach.
+**Tradeoff**: +0.375 bpv overhead (3 extra fp16 norms per 128 elements). turbo3_tcq: 3.25→3.625 bpv, turbo2_tcq: 2.25→2.625 bpv.
+**Simulation** (2026-03-29, `scripts/pq_simulate.py`):
+- 3-bit: per-32 norm correction gives **+5.2% MSE improvement** (per-128: 0.000335, per-32: 0.000318)
+- 2-bit: per-32 norm correction gives **+3.6% MSE improvement** (per-128: 0.000934, per-32: 0.000900)
+- Per-32 independent normalization (turbo3_0 approach): +10.4% and +5.9% respectively
+**Assessment**: Modest gain. TCQ's 50.1% coding gain dwarfs the 5% from finer norms. The +0.375 bpv overhead may not justify the format change. signalnine's results (6.01 vs 6.06 at 2-bit) confirm the gain is small in practice.
 
 ### 63. Parallel FWHT encode (all-thread butterfly) `done`
 **Source**: signalnine's set-rows.cu. 128 threads participate in FWHT via shared memory butterfly.
@@ -774,22 +802,25 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Source**: signalnine. Pad head_dim to next multiple of 128.
 **Result**: Implemented as experiment #58 (zero-padding approach). Always GROUP_SIZE=128, no template branching needed.
 
-### 65. Sparse V dequant — skip negligible attention weights `planned`
-**Source**: signalnine/TheTom. Skip V dequant+accumulation when all attention weights < 1e-6.
-**Expected gain**: +22.8% decode at 32K (TheTom's number). More at longer context. Zero quality impact.
-**Risk**: Very low — ~3 lines in fattn-vec.cuh, purely additive.
+### 65. Sparse V dequant — skip negligible attention weights `done`
+**Source**: signalnine/TheTom. Duplicate of #51 — already implemented and verified.
+**Result**: See #51. Zero quality loss, +10.9% decode on MoE at 8K. Eliminates native dequant context scaling regression.
 
-### 66. Fused attention+dequant kernel — eliminate fp16 intermediate `planned`
-**Concept**: Dequant K/V inline during attention instead of pre-dequanting to fp16 buffer. For turbo3: 3 instructions per element (extract index, load centroid, multiply norm). For TCQ: sliding window + codebook lookup.
-**Expected gain**: 1.5-2x decode speedup at long context. This is the fork-justifying feature — nobody else has fused attention for custom VQ codebooks.
-**Risk**: High — requires rewriting fattn-vec and fattn-mma kernels. Register pressure is the main concern.
+### 66. Fused attention+dequant kernel — eliminate fp16 intermediate `done`
+**Concept**: Dequant K/V inline during attention instead of pre-dequanting to fp16 buffer. Native turbo2/3 vec_dot_KQ and dequantize_V already existed — just bypassed by conservative decode dequant path.
+**Result**: PPL matches baseline (5.8501 vs 5.8323, within error). No measurable decode speed improvement — KV bandwidth is <2% of total at 32K with only 4 KV heads. Value is code simplification (no cudaMallocAsync per decode) and OOM headroom at long context.
+**Note**: turbo4 already used the fused path. TCQ types still need fused vec_dot/dequantize_V implementations.
 
 ### 67. Speculative decoding with turbo-enabled larger draft models `planned`
 **Concept**: turbo KV on target model frees VRAM, allowing a larger/better draft model. Qwen3.5-27B Q6_K + turbo3 KV at 64K frees ~2.2 GB vs q8_0 — enough for 3B draft in Q4 instead of 0.5B.
 
-### 68. 256-element TCQ blocks for head_dim=256 models `planned`
-**Concept**: Run Viterbi trellis over 256 elements (full head_dim) instead of two independent 128-element groups. Longer trellis = better coding gain. Only benefits head_dim=256 models.
-**Priority**: Medium — nice paper result showing TCQ scales with block length.
+### 68. 256-element TCQ blocks for head_dim=256 models `dropped`
+**Concept**: Run Viterbi trellis over 256 elements (full head_dim) instead of two independent 128-element groups. Longer trellis = reduced terminal effects at block boundaries.
+**Simulation** (2026-03-29, `tcq_train_vectorized.py --n-elements 256`, full GLA n_train=2000, n_iters=30):
+- 3-bit: 128-elem **47.6%** reduction (2.81 dB), 256-elem **47.6%** (2.81 dB) — **identical**
+- 2-bit: 128-elem **27.9%** reduction (1.42 dB), 256-elem **27.6%** (1.40 dB) — **identical**
+**Analysis**: TCQ coding gain is per-element, determined by trellis structure (k, L), not sequence length. Terminal effects (L/T = 9/128 = 7%) are too small to move the needle.
+**Verdict**: Dropped. 128-element block is optimal.
 
 ### 69. Temperature scaling — attention sharpening via norm inflation `done`
 **Source**: Competitive analysis 2026-03-31. Duster's TBQ accidentally inflates norms 2.77x, acting as attention temperature T=0.36.
@@ -855,10 +886,10 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: Offer Lloyd-Max scalar quantize as a fast encode path (e.g., for streaming/real-time), with TCQ Viterbi as the quality path. Runtime flag to select. Zero code sharing issues — the two encoders write the same bitstream format if we match centroids.
 **Risk**: Quality regression vs TCQ. Only useful if encode speed matters (batch inference, very long prompts).
 
-### 80. Padding non-128 head_dim completion `ready`
+### 80. Padding non-128 head_dim completion `done`
 **Source**: Infrastructure comparison — Duster has it done, ours is "in progress" (#58/#64).
-**Status**: Code changes done, needs final build+test verification.
-**Test**: Verify PPL on a head_dim=128 model (e.g., Llama-3) and head_dim=256 model (Qwen3.5).
+**Implementation**: Re-implemented (previous code lost with deleted branch). Pad allocation, get_k/v, cpy_k/v, Q padding + output crop in build_attn.
+**Results**: Phi-3-mini (head_dim=96→128): turbo3 +5.6% PPL, 73.8% decode speed of q8_0. No regression on 128/256-aligned models.
 
 ### 81. Sparse V dequant integration with TCQ `done`
 **Source**: #65 planned but not tested with TCQ path. TheTom showed +22.8% decode at 32K.
@@ -871,29 +902,27 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Concept**: Implement explicit 1-bit quantization (just store sign + raw norm) and verify it matches TBQ3 PPL exactly. If it does, this conclusively proves the temperature theory and means TBQ's 3-bit storage wastes 2 bits.
 **Test**: PPL should match TBQ3 at all context lengths. If so, we can publish this finding.
 
-### 83. Adaptive temperature per layer `needs-research`
-**Source**: From MSE-PPL divergence investigation — Q anisotropy varies wildly per layer (layer 19: rank 1.9, layer 20: rank 114). Optimal attention temperature likely varies per layer too.
-**Concept**: Store per-layer alpha in constant memory. Use different temperature scaling per layer based on that layer's Q effective rank.
-**Risk**: Requires knowing Q statistics at quantization time (not available in llama.cpp's online KV quantize). Could use precomputed per-model tables.
+### 83. Adaptive temperature per layer `dropped`
+**Source**: From MSE-PPL divergence investigation — Q anisotropy varies wildly per layer.
+**Result**: Disproven by experiment #91 (per-layer alpha gradient). Comprehensive KLD sweep of 29 linear schedules showed uniform α=1.04 is optimal — no depth gradient helps. The α=1.04 sweet spot is a global property of the FWHT+quantization pipeline, not per-layer.
 
 ### 84. 350K+ context validation `blocked`
 **Source**: Duster's chunked cuBLAS GEMM enables 350K+ on single 3090. Currently we OOM much earlier.
 **Concept**: After implementing #72, benchmark at 128K/256K/350K. Verify PPL doesn't degrade, measure speed.
 **Depends**: #72 (chunked cuBLAS GEMM prefill) — **REJECTED** (slower). Need alternative approach for long-context VRAM savings.
 
-### 85. Product-aware TCQ codebook training `needs-research`
-**Source**: Ordentlich & Polyanskiy, "Optimal Quantization for Matrix Multiplication" (arXiv:2410.13780, Oct 2024). Proves that the MSE-optimal quantizer is NOT optimal for approximating A^T B (the attention dot product). The rate-distortion function for matrix products differs from standard rate-distortion. Key result: at sub-0.906 bpw, dimensionality reduction before quantization is provably optimal; above that, the product-aware distortion metric still differs from MSE.
-**Related**: NestQuant (Savkin, Porat, Ordentlich, Polyanskiy, arXiv:2502.09720, ICML 2025) — applies nested E8 lattice quantization to KV cache with Hadamard rotation. Achieves 55% PPL gap reduction vs SpinQuant on Llama-3-8B at 4-bit W+A+KV. No speed benchmarks published. E8 lattice coding gain is only 0.65 dB over scalar — our TCQ gives 2-3 dB, so E8 itself is not a threat. NestQuant's edge comes from the product-aware objective, not the lattice.
-**Also**: "High-Rate Quantized Matrix Multiplication" (arXiv:2601.17187, Jan 2026) — follow-up introducing WaterSIC, within 0.25 bits of optimal. Shows GPTQ+rotation is within 0.1 bit of WaterSIC. "Optimal Scalar Quantization for Matrix Multiplication" (Ang, Kim, Pilanci, arXiv:2603.19559, Mar 2026) — closed-form optimal density with phase transition at |ρ| = 1/√3.
-**Concept**: Modify GLA codebook training to minimize attention error (Q @ K^T product distortion) instead of MSE. Currently our GLA trains on i.i.d. N(0,1) samples minimizing per-element MSE. Instead, generate (Q, K) pairs, quantize K with candidate codebook via Viterbi, compute ‖Q^T K - Q^T K̂‖² as the training loss. The Ordentlich-Polyanskiy theory says this is a fundamentally different optimum.
-**Connection to Q-anisotropy**: Our multilayer analysis found Q effective rank varies wildly per layer (layer 19: rank 1.9, layer 20: rank 114). A product-aware codebook would naturally weight errors along Q's dominant directions — exactly where MSE-trained codebooks are provably suboptimal. This also connects to the MSE-PPL divergence (#76 plan): lower MSE codebooks may put more error into Q-sensitive directions.
-**Implementation sketch**:
-1. Extract real Q vectors from model (dump during PPL eval, similar to K dump in multilayer plan)
-2. Modify numpy GLA: replace `mse = (x - codebook[state])²` with `product_error = (Q @ (x - codebook[state]))²` weighted by Q singular values
-3. Train codebooks on (Q, K) pairs per-layer or aggregated
-4. Compare: MSE-trained vs product-trained codebooks at 2K/8K/32K PPL
-**Risk**: Medium — Q statistics may vary too much across tokens/positions for a single codebook to capture. May need per-layer codebooks (already explored in multilayer plan). Training cost increases significantly (need Q data, not just K).
-**Expected**: If Ordentlich-Polyanskiy theory applies to our setting, product-aware codebooks should close some of the MSE-PPL gap. Even 0.02-0.05 PPL improvement at 2-3 bit would be significant. Could also explain why our "worse MSE" old numpy codebook gives better PPL than "better MSE" high-iteration codebooks.
+### 85. Product-aware TCQ codebook training `done`
+**Source**: Ordentlich & Polyanskiy, "Optimal Quantization for Matrix Multiplication" (arXiv:2410.13780). Product-aware distortion metric differs from MSE.
+**Concept**: Train codebooks to minimize attention error (Q @ K^T product distortion) instead of MSE.
+**Result**: Full campaign completed (2026-04-01/02). Product-mono codebooks trained via numpy GLA with product-aware loss. Tested iter001-iter100 across 2K-32K contexts with alpha sweeps.
+**Key findings** (see #86 for full scaling law data):
+- Trained codebooks win 4K-24K, peaking at -3.7% KLD (24K, iter100@α=1.00)
+- Crossover to compiled-in at ~30K — compiled-in wins at 32K+
+- 50-iter GLA from coset init is optimal. No synthetic-to-real gap.
+- Optimal iteration increases with context: iter060 (4K) → iter100 (16K-24K)
+- 2-bit: product-mono/iter090@α=1.04 wins at 2K (0.094057 vs 0.100336 compiled-in)
+- MSE-PPL divergence resolved: was short-context artifact, not codebook quality issue
+**Conclusion**: Product-aware training helps at medium context (4K-24K) but compiled-in codebooks are competitive at short and long context. The compiled-in codebook is shipped as default; trained codebooks are an optional tuning knob.
 
 ### 86. KLD scaling law: trained vs compiled-in codebooks across context `done`
 **Source**: Overnight multi-server benchmark campaign (2026-04-01). 4 servers: A100, dorei, 3090-A, 3090-B.
@@ -910,21 +939,6 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 8. Cross-GPU validation: identical KLDs on dorei/3090-A with same base logits. A100 differs in absolute values but consistent rankings.
 **Result**: Full data in benchmark-results.md "Scaling Law Summary" section. Actionable: iter100 is the best single trained codebook for 4K-24K. Per-context alpha tuning gives 2-6% quality improvement at zero speed cost. The 32K crossover may reflect a regime change in attention statistics.
 
-### 87. Fine-grained decode-time alpha characterization `ready`
-**Concept**: Find a closed-form mapping `α_decode_optimal = f(context_length)` for both 3-bit and 2-bit. Requires denser sampling in both alpha resolution and context lengths than the coarse 0.02-step × power-of-2 grid used so far.
-**Motivation**: Decode-time alpha is the preferred deployment path (enables context-adaptive scaling without re-encoding KV cache, produces 4% better KLD at 8K+). But the optimal decode alpha varies by context — we need a predictive formula for automatic tuning.
-**Plan**:
-1. Generate base logits for intermediate contexts on dorei: 6K, 12K (need ~34 GB, fits in available disk)
-2. 3-bit decode alpha sweep: 0.005 step from 0.995 to 1.035 at 2K, 4K, 6K, 8K, 12K, 16K, 24K, 32K (9 alphas × 8 contexts = 72 runs)
-3. 2-bit decode alpha sweep: 0.01 step from 1.03 to 1.12 at same contexts (10 alphas × 8 contexts = 80 runs)
-4. Fit curve: expect monotonic relationship between log(context) and optimal alpha
-**Known data** (coarse sweep, 0.02 step):
-- 3-bit decode optimal: 2K→1.02, 4K→1.00, 8K→1.02, 16K→1.02, 24K→1.02, 32K→1.00
-- 2-bit decode optimal: 2K→1.06, 4K→1.00, 8K→1.08, 16K→1.08, 24K→1.10, 32K→1.08
-- At 8K+, decode beats encode by 3-5% at matched alpha
-**Open question**: The 2K/4K decode results look anomalous relative to the smooth 8K+ trend. Finer alpha resolution may reveal the true optima are closer to the 8K+ pattern.
-**Estimated time**: ~17 hours on dorei (long contexts dominate). Could parallelize short contexts to 3090-A/B with fresh builds.
-**Risk**: Low — measurement only, no code changes.
 
 ### 88. Native turbo decode vs dequant+MMA `tested-no-improvement`
 **Source**: Duster issue #8 "fused K tile loading" — adapted as native VEC decode instead of MMA+dequant.
@@ -941,6 +955,39 @@ for all turbo dequant kernels (turbo3, turbo4) in both prefill and decode paths.
 **Result**: 0% prefill speed change (FFN dominates, Q rotation is invisible). **KLD regression**: turbo3 +2.3% (0.075→0.077), turbo3_tcq +7.5% (0.055→0.059). Root cause: inv_fwht outputs K in original domain, fp16 truncation loses more precision than in rotated domain (rotated values are more uniform after FWHT+channel scaling). For QK=32 types, per-block norm mixing through butterfly adds further precision loss.
 **Conclusion**: Reverted. The FWHT rotation that makes values more uniform for quantization also makes them more uniform for fp16 representation. Applying inv_fwht before fp16 cast defeats this benefit.
 **Branch**: experiment/fused-k-dequant
+
+### 90. Gemma 4 architecture support `done`
+**Source**: Google Gemma 4 (April 2026). Cherry-picked from upstream PR #21309 + tokenizer fix #21343.
+**Implementation**: New `gemma4-iswa.cpp` graph builder (311 lines). Architecture support in llama-arch, llama-hparams, llama-model. Tokenizer: BPE with SPM-style whitespace escaping + special newline handling.
+**Features supported**: ISWA (5:1 SWA:global), MoE (128 experts top-k=8 + shared expert), PLE (per-layer embeddings), K=V, shared KV layers, variable head_dim (256/512).
+
+**D=512 VEC kernel fixes** (3 bugs):
+1. `get_best_fattn_kernel` head_dim switch missing `case 512:` → FA ops falling to CPU → segfault
+2. Turbo prefill MMA path has no D=512 templates → abort. Fix: fall back to VEC when D>256
+3. Decode dequant→fp16 at D=512 routing to MMA instead of VEC → abort. Fix: skip dequant at D>256
+
+**Results** (see benchmark-results.md for full data):
+- **26B MoE**: K-only turbo3 is free (-1.7% PPL). V catastrophic (+70%). Recommend K-only.
+- **31B dense**: K-only turbo3 helps PPL (-10.2%!). K+V only +5.3%. Recommend K+V.
+- Decode speed 76-90% of q8_0 (MoE/dense model compute dominates).
+- Qwen3.5-27B regression: none (5.8501 vs 5.8377 golden).
+
+**Note**: head_dim=256/512 are already 128-aligned, so no head padding needed.
+
+### 91. Per-layer alpha gradient for TCQ V quantization `tested-negative`
+**Concept**: Different V alpha per layer: `α_l = base + slope * (l / (n_layers - 1))`. Deeper layers accumulate more error, may benefit from higher alpha. Linear schedule as simplest possible depth-dependent scaling.
+**Implementation**: `__constant__` arrays `d_tcq_norm_alpha_v_per_layer[256]` and `d_tcq_per_layer_alpha_enabled` in turbo-quant-cuda.cuh. Layer index extracted from tensor name (`cache_v_l42`). Env vars: `TURBO_TCQ_ALPHA_V_FUNC=base,slope`, `TURBO_TCQ_N_LAYERS=N`.
+**PPL screening** (Qwen3.5-27B, 2K, 8 chunks, base=0.98):
+- slope -0.10 → PPL 7.2011, slope +0.02 → PPL 6.9374. Clear monotonic improvement with positive slope — deeper layers benefit from higher alpha.
+**KLD sweep** (Qwen3.5-27B, 2K, 16 chunks, 29 configurations):
+- **Uniform α=1.04: KLD 0.051270** (baseline)
+- base=1.04 slope=0.00: KLD 0.051270 (validates implementation — exact match)
+- **Every positive slope degrades KLD**: smallest tested (+0.02) → 0.060794 (+18.6%), largest (+0.14) → 0.094316 (+84%)
+- base=1.06 slope=+0.14: best PPL (5.722) but worst KLD (0.104, +103%)
+- No configuration across 4 bases × 7 slopes beats uniform
+**Key finding**: PPL and KLD diverge dramatically. PPL monotonically improves with positive slope. KLD monotonically worsens. The PPL "improvement" is distributional distortion, not fidelity.
+**Root cause**: α=1.04 reflects a global property of the FWHT + quantization pipeline (optimal norm inflation), not a per-layer effect. All layers need the same correction factor.
+**Conclusion**: Linear depth gradients do not help. Publishable negative result demonstrating PPL is unreliable for KV cache quantization parameter optimization.
 
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
