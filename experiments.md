@@ -989,6 +989,22 @@ VecInfer works because they skip rotation entirely (PQ on raw correlated K vecto
 **Root cause**: α=1.04 reflects a global property of the FWHT + quantization pipeline (optimal norm inflation), not a per-layer effect. All layers need the same correction factor.
 **Conclusion**: Linear depth gradients do not help. Publishable negative result demonstrating PPL is unreliable for KV cache quantization parameter optimization.
 
+### 93. S8: Padded SMEM codebook layout `rejected`
+**Concept**: Add 1 padding slot per 32 codebook entries (512→528) to break mod-32 bank aliasing. Access via `cb[state + (state >> 5)]`.
+**Results** (Gemma 4 31B, turbo3_tcq): pp512 -9.7% (410→370), tg128 -0.9%
+**Why it failed**: Bank conflicts from random TCQ state lookups are inherent to birthday problem (32 threads, 32 banks, uniform random access). Redistributing entries doesn't change collision probability. Extra ALU per lookup causes net regression.
+
+### 94. S7: FP16 QK accumulation `rejected`
+**Concept**: Use half2 `__hfma2` (2x throughput on Ampere) for Q*K dot product accumulation instead of float FMA.
+**Results** (Gemma 4 31B, turbo3_tcq): pp512 +1.8% (410→417) but PPL = 1467 (should be ~10).
+**Why it failed**: On NVIDIA, Q is stored as float2 (`V_DOT2_F32_F16_AVAILABLE` is AMD-only). Converting both K and Q from float→half for `__hfma2` introduces fatal rounding error. Initial +13.5% result was a bug (reading float2 as half2 = garbage).
+**Key insight**: NVIDIA llama.cpp VEC kernel uses float Q registers. Half-precision QK reduction only works on AMD (where Q is natively half2) or with tensor cores (FlashInfer's approach — different kernel architecture).
+
+### 95. 2-bit decode-time V alpha fine calibration `done`
+**Concept**: Fine-grained (0.005-step) decode-time V alpha sweep for turbo2_tcq at 2K/7K/16K/32K to find true optima and fit a better adaptive formula.
+**Results**: Old formula had 0.033 error at 2K. New formula `α = 0.8865 + 0.0195 × ln(n_kv)` reduces max error to 0.014. End-to-end adaptive validation: 2K=0.101, 7K=0.136, 16K=0.129, 32K=0.085.
+**Key insight**: 2-bit optimal alpha increases with context (opposite of 3-bit), from ~1.03 at 2K to ~1.08 at 32K. Surface is noisy but trend is clear and well-captured by log formula. New slope is nearly 2× steeper than old.
+
 ### DeltaKV (#44b) — inter-token residual compression `dropped`
 **Paper**: arXiv:2602.08005 (Feb 2026). Learned MLP compressor, strided reference tokens, global L2 retrieval.
 **Analysis**: Requires training (~8 GPU hours per model), learned projections (MLP weights per layer), and a full framework rewrite (Sparse-vLLM). Fundamentally incompatible with our fixed-codebook approach. The per-token reference lookup is O(S) per token, not feasible in a CUDA kernel during SET_ROWS. **Verdict: wrong paradigm for llama.cpp integration.**
