@@ -362,7 +362,7 @@ jobs:
 
       - name: Pack artifacts
         run: |
-          7z a -snl llama-bin-win-hip-${{ matrix.name }}-x64.zip .\build\bin\Release\ggml-hip.dll
+          7z a -snl llama-bin-win-hip-${{ matrix.name }}-x64.zip .\build\bin\ggml-hip.dll
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
