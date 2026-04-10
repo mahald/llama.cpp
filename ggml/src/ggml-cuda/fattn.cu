@@ -466,6 +466,47 @@ static __global__ void k_turbo4_dequant_f16(
 // turbo3 K dequant with inverse FWHT: produces K in original (unrotated) domain
 // so Q does NOT need pre-rotation. 128 threads per block, loops over 128-element FWHT groups
 // (each group spans 4 turbo3 storage blocks of 32 elements; all 4 blocks share the same norm).
+// In-place 128-point inverse FWHT spread across 128 threads, one element per thread.
+// h=1..16 use intra-warp __shfl_xor_sync (no smem, no syncthreads).
+// h=32 and h=64 cross warp boundaries, so we fall back to smem with syncs.
+// Caller supplies a __shared__ float[128] scratch buffer.
+static __device__ __forceinline__ float fwht128_butterfly_inplace(float val, float * smem) {
+    const int tid = threadIdx.x;
+
+    // Intra-warp passes: shuffle xor with stride h, no smem, no sync.
+    #pragma unroll
+    for (int h = 1; h <= 16; h *= 2) {
+        const float other = __shfl_xor_sync(0xFFFFFFFF, val, h);
+        val = (tid & h) ? (other - val) : (val + other);
+    }
+
+    // h=32 (cross-warp within block, smem needed)
+    smem[tid] = val;
+    __syncthreads();
+    val = (tid & 32) ? (smem[tid - 32] - val) : (val + smem[tid + 32]);
+    __syncthreads();
+
+    // h=64 (cross-warp within block, smem needed)
+    smem[tid] = val;
+    __syncthreads();
+    val = (tid & 64) ? (smem[tid - 64] - val) : (val + smem[tid + 64]);
+    __syncthreads();
+
+    return val;
+}
+
+// Pair-pack two adjacent threads' fp16 outputs into a single 32-bit half2 store.
+// Halves the global store count vs. one __float2half per thread.
+static __device__ __forceinline__ void fwht128_store_half(
+        float val, half * dst_base) {
+    const int tid = threadIdx.x;
+    const float neighbor = __shfl_xor_sync(0xFFFFFFFF, val, 1);
+    if ((tid & 1) == 0) {
+        const half2 packed = __floats2half2_rn(val, neighbor);
+        *((half2 *)(dst_base + tid)) = packed;
+    }
+}
+
 static __global__ void k_turbo3_dequant_f16_inv_fwht(
         const char * __restrict__ src, half * __restrict__ dst,
         const int64_t ne0, const int64_t ne1, const int64_t ne2,
@@ -501,22 +542,12 @@ static __global__ void k_turbo3_dequant_f16_inv_fwht(
         const uint8_t hi1  = (blk->signs[j_in_blk / 8] >> (j_in_blk % 8)) & 0x1;
         const float c = d_turbo_centroids_3bit_fattn[low2 | (hi1 << 2)];
 
-        smem[tid] = c * s2[tid];
-        __syncthreads();
-
-        // 7 butterfly passes (un-normalized FWHT, normalization applied below)
-        for (int h = 1; h < 128; h *= 2) {
-            if (tid < 64) {
-                int j = (tid / h) * (2 * h) + (tid % h);
-                float a = smem[j], b = smem[j + h];
-                smem[j] = a + b; smem[j + h] = a - b;
-            }
-            __syncthreads();
-        }
+        // Inverse FWHT: 5 intra-warp shfl passes + 2 cross-warp smem passes.
+        float val = fwht128_butterfly_inplace(c * s2[tid], smem);
 
         // Normalize, apply signs1, undo InnerQ scaling, multiply by norm, cast to fp16
-        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
-        dst[dst_base + g * 128 + tid] = __float2half(val);
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        fwht128_store_half(val, dst + dst_base + g * 128);
         __syncthreads();
     }
 }
@@ -547,25 +578,13 @@ static __global__ void k_turbo4_dequant_f16_inv_fwht(
         const block_turbo4_0 * blk = (const block_turbo4_0 *)src_row + blk_idx;
         const float norm = __half2float(blk->norm);
 
-        // Extract 4-bit index, lookup centroid, apply signs2
         const uint8_t idx = (tid & 1) ? (blk->qs[tid / 2] >> 4) : (blk->qs[tid / 2] & 0xF);
-        smem[tid] = d_turbo_centroids_4bit_fattn[idx] * s2[tid];
+
+        float val = fwht128_butterfly_inplace(d_turbo_centroids_4bit_fattn[idx] * s2[tid], smem);
+
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
         __syncthreads();
-
-        // 7 butterfly passes (inverse FWHT)
-        for (int h = 1; h < 128; h *= 2) {
-            if (tid < 64) {
-                int j = (tid / h) * (2 * h) + (tid % h);
-                float a = smem[j], b = smem[j + h];
-                smem[j] = a + b; smem[j + h] = a - b;
-            }
-            __syncthreads();
-        }
-
-        // Normalize, apply signs1, undo InnerQ scaling, apply norm, cast to fp16
-        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
-        dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
-        __syncthreads();  // ensure all threads finish reading smem before next iter writes it (matches turbo3/turbo2 inv_fwht)
     }
 }
 
@@ -604,20 +623,10 @@ static __global__ void k_turbo2_dequant_f16_inv_fwht(
         const uint8_t idx = (blk->qs[j_in_blk / 4] >> ((j_in_blk % 4) * 2)) & 0x3;
         const float c = d_turbo_centroids_2bit_fattn[idx];
 
-        smem[tid] = c * s2[tid];
-        __syncthreads();
+        float val = fwht128_butterfly_inplace(c * s2[tid], smem);
 
-        for (int h = 1; h < 128; h *= 2) {
-            if (tid < 64) {
-                int j = (tid / h) * (2 * h) + (tid % h);
-                float a = smem[j], b = smem[j + h];
-                smem[j] = a + b; smem[j + h] = a - b;
-            }
-            __syncthreads();
-        }
-
-        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
-        dst[dst_base + g * 128 + tid] = __float2half(val);
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        fwht128_store_half(val, dst + dst_base + g * 128);
         __syncthreads();
     }
 }
@@ -657,20 +666,10 @@ static __global__ void k_turbo3_tcq_dequant_f16_inv_fwht(
         const int state = (raw >> bit_off) & 0x1FF;
         const float c = d_turbo3_tcq_codebook_fattn[state];
 
-        smem[tid] = c * s2[tid];
-        __syncthreads();
+        float val = fwht128_butterfly_inplace(c * s2[tid], smem);
 
-        for (int h = 1; h < 128; h *= 2) {
-            if (tid < 64) {
-                int j = (tid / h) * (2 * h) + (tid % h);
-                float a = smem[j], b = smem[j + h];
-                smem[j] = a + b; smem[j + h] = a - b;
-            }
-            __syncthreads();
-        }
-
-        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
-        dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
         __syncthreads();
     }
 }
@@ -709,20 +708,10 @@ static __global__ void k_turbo2_tcq_dequant_f16_inv_fwht(
         const int state = (raw >> bit_off) & 0xFF;
         const float c = d_turbo2_tcq_codebook_fattn[state];
 
-        smem[tid] = c * s2[tid];
-        __syncthreads();
+        float val = fwht128_butterfly_inplace(c * s2[tid], smem);
 
-        for (int h = 1; h < 128; h *= 2) {
-            if (tid < 64) {
-                int j = (tid / h) * (2 * h) + (tid % h);
-                float a = smem[j], b = smem[j + h];
-                smem[j] = a + b; smem[j + h] = a - b;
-            }
-            __syncthreads();
-        }
-
-        float val = smem[tid] * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
-        dst[dst_base + blk_idx * 128 + tid] = __float2half(val);
+        val = val * inv_sqrt_128 * s1[tid] * d_innerq_channel_scale_inv_fattn[tid] * norm;
+        fwht128_store_half(val, dst + dst_base + blk_idx * 128);
         __syncthreads();
     }
 }
@@ -776,33 +765,19 @@ static __global__ void k_turbo_fwht_forward(
 
     __shared__ float buf[128];
 
-    if (threadIdx.x < 128) {
-        // InnerQ: apply inverse channel scale to Q before rotation
-        // This compensates for the channel scaling applied to K in SET_ROWS
-        buf[threadIdx.x] = src[offset + threadIdx.x] * d_innerq_channel_scale_inv_fattn[threadIdx.x] * s1[threadIdx.x];
-    }
-    __syncthreads();
+    // InnerQ: apply inverse channel scale to Q before rotation
+    float val = src[offset + threadIdx.x] * d_innerq_channel_scale_inv_fattn[threadIdx.x] * s1[threadIdx.x];
 
-    // Parallel FWHT butterfly: 64 threads, 7 passes
-    for (int h = 1; h < 128; h *= 2) {
-        if (threadIdx.x < 64) {
-            int j = (threadIdx.x / h) * (2 * h) + (threadIdx.x % h);
-            float a = buf[j], b = buf[j + h];
-            buf[j] = a + b; buf[j + h] = a - b;
-        }
-        __syncthreads();
-    }
+    val = fwht128_butterfly_inplace(val, buf);
 
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
-    if (threadIdx.x < 128) {
-        float val = buf[threadIdx.x] * inv_sqrt_128 * s2[threadIdx.x];
-        dst[offset + threadIdx.x] = val;
+    val = val * inv_sqrt_128 * s2[threadIdx.x];
+    dst[offset + threadIdx.x] = val;
 
-        // Q² calibration: accumulate per-position squared values
-        if (d_q_calibrate_fattn) {
-            atomicAdd(&d_q_channel_sq_fattn[threadIdx.x], (double)(val * val));
-            if (threadIdx.x == 0) atomicAdd(&d_q_channel_count_fattn, 1);
-        }
+    // Q² calibration: accumulate per-position squared values
+    if (d_q_calibrate_fattn) {
+        atomicAdd(&d_q_channel_sq_fattn[threadIdx.x], (double)(val * val));
+        if (threadIdx.x == 0) atomicAdd(&d_q_channel_count_fattn, 1);
     }
 }
 
