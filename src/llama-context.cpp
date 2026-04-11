@@ -346,6 +346,23 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // turbo3/turbo4 KV cache stores data in FWHT-rotated space.
+        // Q pre-rotation and V inverse rotation are only implemented in the Flash Attention path.
+        // Without FA, attention computes dot(Q_unrotated, K_rotated) = garbage.
+        // Must enable FA BEFORE sched_reserve() so the scheduler knows FA is required
+        // and builds the graph plan with FA ops on GPU from the start.
+        {
+            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ);
+            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ);
+            if (turbo_k || turbo_v) {
+                if (!cparams.flash_attn) {
+                    LLAMA_LOG_WARN("%s: turbo KV cache requires Flash Attention — enabling automatically\n", __func__);
+                    cparams.flash_attn = true;
+                }
+                cparams.auto_fa = false;  // turbo requires FA — don't let sched_reserve override
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -2961,6 +2978,7 @@ llama_context * llama_init_from_model(
         }
     }
 
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
@@ -2980,6 +2998,16 @@ llama_context * llama_init_from_model(
                     __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
                 return nullptr;
             }
+        }
+    }
+
+    // Auto-enable flash attention for turbo KV cache types
+    {
+        const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ);
+        const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ);
+        if ((turbo_k || turbo_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_WARN("%s: turbo KV cache requires flash attention — enabling automatically\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         }
     }
 

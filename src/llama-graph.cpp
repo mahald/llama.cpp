@@ -1871,6 +1871,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
+    // TODO: TurboQuant pre-rotate-queries optimization (WIP — PPL 23.5 vs 6.19 target)
+    // The graph-side rotation approach works mechanically (ggml_mul_mat rotates correctly)
+    // but gives 4x worse PPL than dequant-side rotation for unknown reasons.
+    // Keeping dequant inverse rotation for now until this is resolved.
+    // See: docs/turbo-speed-investigation.md for full debugging history
+
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
@@ -1979,6 +1985,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
     }
+
+    // TODO: TurboQuant V inverse rotation (WIP — part of pre-rotate-queries optimization)
+    // See comment above for status
 
     ggml_build_forward_expand(gf, cur);
 
@@ -2138,11 +2147,42 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TurboQuant Q pre-rotation is handled inline in CUDA FA kernels:
+    // - Vec kernel: shared memory FWHT (fattn-vec.cuh)
+    // - Prefill MMA: separate Q rotation kernel (fattn.cu)
+
+    // Pad Q to match K's padded head_dim (turbo FWHT requires 128-aligned heads)
+    const int64_t orig_head_dim = q->ne[0];
+    const bool head_padded = (q->ne[0] < k->ne[0]);
+    if (head_padded) {
+        q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot) {
+    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
+    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
+        if (cur->ne[0] % 128 == 0) {
+            cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
+            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
+        }
+    } else if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+    }
+
+    // Crop output back to original head_dim after turbo head padding
+    // cur is 2D [padded_head * n_head_q, n_tokens] — unflatten, crop per-head, reflatten
+    if (head_padded) {
+        const int64_t padded_head = k->ne[0];
+        const int64_t n_head_q = cur->ne[0] / padded_head;
+        const int64_t n_tok = cur->ne[1];
+        cur = ggml_reshape_3d(ctx0, cur, padded_head, n_head_q, n_tok);
+        cur = ggml_view_3d(ctx0, cur,
+            orig_head_dim, n_head_q, n_tok,
+            cur->nb[1], cur->nb[2], 0);
+        cur = ggml_cont(ctx0, cur);
+        cur = ggml_reshape_2d(ctx0, cur, orig_head_dim * n_head_q, n_tok);
     }
 
     if (wo) {
@@ -2308,7 +2348,13 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (v_rot) {
+    // TurboQuant V un-rotation at graph level (CUDA graph compatible)
+    if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO3_TCQ || v->type == GGML_TYPE_TURBO2_TCQ) {
+        if (cur->ne[0] % 128 == 0) {
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
+        }
+    } else if (v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, v_rot);
     }
 
