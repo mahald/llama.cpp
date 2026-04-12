@@ -6,7 +6,7 @@
 
 > **This is a highly experimental fork of llama.cpp. Use at your own discretion.**
 
-## Tested on RTX 4080 Laptop GPU
+## Tested on RTX 4080 Laptop GPU (Ubuntu 25.10)
 
 Compiled with CUDA as described in the [Build](#build) section below. Some configurations that work very nicely in my tests:
 
