@@ -8,13 +8,6 @@ static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, in
                         idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
 }
 
-// get 2D slice view from a 3D tensor, the idx corresponds to the 3rd dim
-static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, int idx) {
-    GGML_ASSERT(idx < (int) x->ne[2]);
-    return ggml_view_2d(ctx0, x, x->ne[0], x->ne[1], ggml_row_size(x->type, x->ne[0]),
-                        idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
-}
-
 llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params),
         model(model),
