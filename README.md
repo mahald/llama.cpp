@@ -6,6 +6,23 @@
 
 > **This is a highly experimental fork of llama.cpp. Use at your own discretion.**
 
+## Tested on RTX 4080 Laptop GPU
+
+Compiled with CUDA as described in the [Build](#build) section below. Some configurations that work very nicely in my tests:
+
+```sh
+# Gemma 4 E4B with turbo2 KV cache
+./build/bin/llama-server --host 0.0.0.0 --port 8080 -ngl 99 -fa on -ctk turbo2 -ctv turbo2 \
+  -m /models/unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_S.gguf
+
+# Bonsai 8B with TCQ KV cache
+./build/bin/llama-server --host 0.0.0.0 --port 8080 -ngl 99 \
+  -m /models/prism-ml/Bonsai-8B-gguf/Bonsai-8B.gguf \
+  --temp 0 --top-p 0.85 --top-k 20 -ctk turbo3_tcq -ctv turbo2_tcq
+```
+
+---
+
 A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with **Trellis-Coded Quantization (TCQ)** for KV cache compression. 2-3x more context in the same VRAM, with quality that matches or beats FP16.
 
 **Paper**: [Closing the Gap: Trellis-Coded Quantization for KV Cache at 2-3 Bits](https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache)
