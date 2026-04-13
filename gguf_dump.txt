@@ -1,0 +1,1 @@
+C:\Users\u53r1\llama-cpp-turboquant\examples\gguf\gguf.cpp:263: GGML_ASSERT((mode == "r" || mode == "w") && "mode must be r or w") failed

@@ -224,6 +224,45 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                 [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
 #endif
 
+                // TurboQuant: auto-select dequant path based on hardware
+                // M1/M2/M3/M4 (no tensor API): 4-mag LUT (+38-45% decode at long ctx)
+                // M5+ (has tensor API): 8-entry full LUT (best decode speed)
+                {
+                    const char * force_4mag = getenv("TURBO_FORCE_4MAG");
+                    // Always compile with 4-mag support. The dispatch code selects
+                    // 4-mag vs 8-LUT based on context depth at runtime.
+                    // Pre-M5: always 4-mag (constant cache too slow)
+                    // M5+: 4-mag for mid-context (8K-20K), 8-LUT otherwise
+                    if (!ggml_metal_device_get_props(dev)->has_tensor || (force_4mag && force_4mag[0] == '1')) {
+                        [prep setObject:@"1" forKey:@"TURBO_USE_4MAG"];
+                        GGML_LOG_INFO("%s: turbo3 using 4-mag LUT%s\n", __func__,
+                            force_4mag ? " (forced)" : " (pre-M5 hardware)");
+                    }
+                    // Sparse V dequant: skip V for negligible attention weights
+                    // Enabled by default on M5+ (verified: PPL identical, NIAH 9/9)
+                    // Pre-M5: opt-in via TURBO_SPARSE_V=1 until verified on M2
+                    const char * sparse_v_env = getenv("TURBO_SPARSE_V");
+                    const bool sparse_v_auto = ggml_metal_device_get_props(dev)->has_tensor;  // M5+
+                    const bool sparse_v_forced = sparse_v_env && sparse_v_env[0] == '1';
+                    if (sparse_v_auto || sparse_v_forced) {
+                        [prep setObject:@"1" forKey:@"TURBO_SPARSE_V"];
+                        GGML_LOG_INFO("%s: turbo3 sparse V dequant enabled%s\n", __func__,
+                            sparse_v_forced ? " (forced)" : "");
+                    }
+                    // TODO: context-adaptive dispatch — compile both 4-mag and 8-LUT
+                    // FA kernel instantiations, select based on ne11 (KV cache size)
+                    // at dispatch time in ggml_metal_op_flash_attn_ext()
+                }
+
+                // TurboQuant profiling: set TURBO_PROFILE_MODE env var (0-4)
+                {
+                    const char * pm = getenv("TURBO_PROFILE_MODE");
+                    if (pm && pm[0] >= '0' && pm[0] <= '4') {
+                        [prep setObject:[NSString stringWithUTF8String:pm] forKey:@"TURBO_PROFILE_MODE"];
+                        GGML_LOG_INFO("%s: TURBO_PROFILE_MODE=%s\n", __func__, pm);
+                    }
+                }
+
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
 
@@ -1168,6 +1207,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_TURBO_WHT:
+            return op->src[0]->ne[0] % 128 == 0;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
@@ -1248,6 +1289,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
                         return false;

@@ -204,6 +204,149 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+// Forward declarations for TurboQuant CPU functions (defined in ggml-turbo-quant.c)
+extern void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k);
+extern void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k);
+extern void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+extern void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+// Forward declarations for simple (rotation-free) dequant — defined below
+static void dequantize_row_turbo3_0_simple(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+static void dequantize_row_turbo4_0_simple(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+// TurboQuant vec_dot: dequantize turbo block to f32, then dot with f32 query vector
+// These are simple reference implementations for CPU attention (Q * K^T)
+static void ggml_vec_dot_turbo3_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_UNUSED(nrc);
+
+    float tmp[QK_TURBO3];
+    const int nb = n / QK_TURBO3;
+    const block_turbo3_0 * x = (const block_turbo3_0 *)vx;
+    const float * y = (const float *)vy;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_turbo3_0_simple(x + i, tmp, QK_TURBO3);
+        for (int j = 0; j < QK_TURBO3; j++) {
+            sumf += tmp[j] * y[i * QK_TURBO3 + j];
+        }
+    }
+    *s = sumf;
+}
+
+static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_UNUSED(nrc);
+
+    float tmp[QK_TURBO4];
+    const int nb = n / QK_TURBO4;
+    const block_turbo4_0 * x = (const block_turbo4_0 *)vx;
+    const float * y = (const float *)vy;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_turbo4_0_simple(x + i, tmp, QK_TURBO4);
+        for (int j = 0; j < QK_TURBO4; j++) {
+            sumf += tmp[j] * y[i * QK_TURBO4 + j];
+        }
+    }
+    *s = sumf;
+}
+
+// Lloyd-Max centroids for 3-bit quantization — must match GPU kernel and ggml-turbo-quant.c
+static const float turbo_centroids_3bit_cpu[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+
+// Nearest centroid via midpoints — must match ggml-turbo-quant.c nearest_centroid_3bit
+static int turbo_nearest_centroid_3bit_cpu(float val) {
+    if (val < -0.154259f) return 0;
+    if (val < -0.091775f) return 1;
+    if (val < -0.043589f) return 2;
+    if (val <  0.000000f) return 3;
+    if (val <  0.043589f) return 4;
+    if (val <  0.091775f) return 5;
+    if (val <  0.154259f) return 6;
+    return 7;
+}
+
+// Simple centroid quantize for turbo3_0 — NO Gaussian rotation
+// The graph applies WHT before SET_ROWS, so we just do centroid quantize here.
+// Must match our GPU kernel in cpy-utils.cuh exactly.
+static void quantize_row_turbo3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    block_turbo3_0 * y = (block_turbo3_0 *)vy;
+    assert(k % QK_TURBO3 == 0);
+    const int nb = k / QK_TURBO3;
+
+    for (int block = 0; block < nb; block++) {
+        const float * xb = x + block * QK_TURBO3;
+
+        // Compute L2 norm
+        float sum_sq = 0.0f;
+        for (int i = 0; i < QK_TURBO3; i++) sum_sq += xb[i] * xb[i];
+        const float norm = sqrtf(sum_sq);
+        y[block].norm = GGML_FP32_TO_FP16(norm);
+
+        const float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+
+        memset(y[block].qs, 0, QK_TURBO3 / 4);
+        memset(y[block].signs, 0, QK_TURBO3 / 8);
+
+        for (int i = 0; i < QK_TURBO3; i++) {
+            const float val = xb[i] * inv_norm;
+            const int idx = turbo_nearest_centroid_3bit_cpu(val);
+
+            // Low 2 bits → qs[], 4 values per byte
+            y[block].qs[i >> 2] |= (uint8_t)((idx & 0x3) << ((i & 3) * 2));
+
+            // High 1 bit → signs[], 8 values per byte
+            if (idx & 0x4) {
+                y[block].signs[i >> 3] |= (uint8_t)(1 << (i & 7));
+            }
+        }
+    }
+}
+
+// Simple centroid dequantize for turbo3_0 — centroid lookup, no rotation
+static void dequantize_row_turbo3_0_simple(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3 == 0);
+    const int nb = k / QK_TURBO3;
+
+    for (int block = 0; block < nb; block++) {
+        const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        for (int j = 0; j < QK_TURBO3; j++) {
+            const int lo = (x[block].qs[j >> 2] >> ((j & 3) * 2)) & 0x3;
+            const int hi = (x[block].signs[j >> 3] >> (j & 7)) & 0x1;
+            const int idx = lo | (hi << 2);
+            y[block * QK_TURBO3 + j] = turbo_centroids_3bit_cpu[idx] * norm;
+        }
+    }
+}
+
+// turbo4_0 quantize — delegates to WHT-enabled version in ggml-turbo-quant.c
+// The external quantize_row_turbo4_0_ref applies forward WHT before centroid search,
+// which Gaussianizes the distribution for near-optimal scalar quantization.
+static void quantize_row_turbo4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    quantize_row_turbo4_0_ref(x, (block_turbo4_0 *)vy, k);
+}
+
+// turbo4_0 dequantize — delegates to WHT-enabled version in ggml-turbo-quant.c
+// The external dequantize_row_turbo4_0 applies inverse WHT after centroid lookup,
+// rotating back to the original coordinate space before scaling by norm.
+static void dequantize_row_turbo4_0_simple(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_turbo4_0(x, y, k);
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -394,6 +537,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_tq2_0,
         .vec_dot                  = ggml_vec_dot_tq2_0_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = quantize_row_turbo3_0,
+        .vec_dot                  = ggml_vec_dot_turbo3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .from_float               = quantize_row_turbo4_0,
+        .vec_dot                  = ggml_vec_dot_turbo4_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_I32] = {
@@ -2037,6 +2192,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                ggml_compute_forward_turbo_wht(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2217,6 +2376,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_TURBO_WHT:
             {
                 n_tasks = n_threads;
             } break;
@@ -2934,6 +3094,10 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         cur = S_v * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_TURBO_WHT:
+                    {
+                        cur = 0;  // no extra workspace needed
                     } break;
                 case GGML_OP_COUNT:
                     {
