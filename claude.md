@@ -17,7 +17,7 @@ merged with claude code.
 
 How to run a server with gemma:
 
-./build/bin/llama-server --host 0.0.0.0  --port 8080 -ngl 99 -fa on -ctk turbo2_tcq -ctv turbo2_tcq -m /home/marcel/.lmstudio/models/unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_S.gguf
+./build/bin/llama-server --host 0.0.0.0 --port 8080 -ngl 99 -fa on -ctk turbo4 -ctv turbo4 -m /home/marcel/.lmstudio/models/unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_S.gguf
 
 How to run a very low memory version with Bonsai 8b:
 
