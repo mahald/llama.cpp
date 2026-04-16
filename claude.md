@@ -4,11 +4,16 @@ This is the [llama.cpp (master branch)](https://github.com/ggml-org/llama.cpp)
 
 it is compiled with:
 
+docker run -it --gpus all -p 8080:8080 -v ~/mh/tests:/mnt/tests -v "$HOME/.cache/huggingface:/root/.cache/huggingface" docker.io/nvidia/cuda:13.0.3-devel-ubuntu24.04 bash
+apt update && apt install -y cmake git libssl-dev
+
 cmake -B build \
   -DGGML_CUDA=ON \
   -DGGML_NATIVE=ON \
   -DGGML_CUDA_FA=ON \
   -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DGGML_CUDA_CUB_3DOT2=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=native \
   -DCMAKE_BUILD_TYPE=Release
 
 cmake --build build -j96
@@ -17,8 +22,54 @@ merged with claude code.
 
 How to run a server with gemma:
 
-./build/bin/llama-server --host 0.0.0.0 --port 8080 -ngl 99 -fa on -ctk turbo4 -ctv turbo4 -m /home/marcel/.lmstudio/models/unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_S.gguf
+./build/bin/llama-server --host 0.0.0.0 --port 8080 -ngl 99 -fa on -ctk q8_0 -ctv turbo4 --jinja --parallel 1 -hf unsloth/gemma-4-E4B-it-GGUF:Q4_K_S --kv-unified
 
-How to run a very low memory version with Bonsai 8b:
+./build/bin/llama-server \
+  --host 0.0.0.0 --port 8080 \
+  -hf unsloth/gemma-4-E4B-it-GGUF:Q4_K_S \
+  -ngl 99 \
+  -fa on \
+  -ctk q8_0 -ctv turbo4 \
+  -c 32768 \
+  --parallel 1 \
+  -t 4 \
+  --jinja
 
-./build/bin/llama-server --host 0.0.0.0 --port 8080 -ngl 99 -m /home/marcel/.lmstudio/models/prism-ml/Bonsai-8B-gguf/Bonsai-8B.gguf --temp 0 --top-p 0.85 --top-k 20 -ctk turbo3_tcq -ctv turbo2_tcq
+
+./build/bin/llama-server --host 0.0.0.0 --port 8080 -ngl 99 -fa on -ctk q8_0 -ctv turbo4 --jinja --no-mmap --parallel 12 -hf unsloth/gemma-4-E4B-it-GGUF:Q4_K_S --kv-unified
+
+./build/bin/llama-server \
+  --host 0.0.0.0 --port 8080 \
+  -hf unsloth/gemma-4-E4B-it-GGUF:Q4_K_S \
+  -ngl 99 \
+  -fa on \
+  -ctk q8_0 -ctv turbo4 \
+  -c 65000 \
+  --parallel 1 \
+  -t 4 \
+  --jinja
+  --kv-unified
+
+./build/bin/llama-server \
+  --host 0.0.0.0 --port 8080 \
+  -hf unsloth/gemma-4-31B-it-GGUF:UD-IQ2_XXS \
+  -ngl 99 \
+  -fa on \
+  -ctk q8_0 -ctv turbo4 \
+  -c 65000 \
+  --parallel 1 \
+  -t 4 \
+  --jinja
+  --kv-unified
+
+./build/bin/llama-server \
+  --host 0.0.0.0 --port 8080 \
+  -hf unsloth/gemma-4-E4B-it-GGUF:Q4_K_S \
+  -ngl 99 \
+  -fa on \
+  -ctk q8_0 -ctv turbo4 \
+  -c 65000 \
+  --parallel 1 \
+  -t 4 \
+  --jinja
+  --kv-unified
